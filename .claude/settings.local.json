@@ -2,7 +2,9 @@
   "permissions": {
     "allow": [
       "Bash(xcopy:*)",
-      "Bash(cmd /c:*)"
+      "Bash(cmd /c:*)",
+      "Bash(git init:*)",
+      "Bash(git add:*)"
     ],
     "deny": [],
     "ask": []
