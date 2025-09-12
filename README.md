@@ -1,17 +1,38 @@
-# Mel (Melchisidek)
+# SpeakEZ (Project Mel)
 
-# GPU-Accelerated Voice Transcription Using Whisper.NET
+<table>
+  <tr>
+    <td align="center" width="100%">
+      <strong>⚠️ Caution: Experimental ⚠️</strong><br>
+      This project is in early development and <i>not</i> intended for production use.
+    </td>
+  </tr>
+</table>
 
-Mel is a high-performance, native AOT-compiled voice transcription service built in F# targeting .NET 10. It combines OpenAI's Whisper speech recognition with CUDA GPU acceleration to provide fast, local voice transcription without cloud dependencies.
+## Push-to-Talk Voice Transcription with Whisper.NET
+
+SpeakEZ is a batch-mode voice transcription application built in F# for .NET 10. It uses OpenAI's Whisper models for accurate speech-to-text conversion in a push-to-talk interface. 
+
+**Important Note:** This is a batch transcription system - you hold F9 to record, and transcription happens when you release. This design choice is based on Whisper's architecture, which is optimized for processing complete audio segments rather than real-time streaming.
+
+## Why Batch Mode?
+
+Whisper models are designed for high-accuracy transcription of complete speech segments, not real-time streaming. This application embraces that limitation to provide:
+- **95%+ accuracy** with sufficient audio context
+- **Complete sentence understanding** 
+- **Proper punctuation and capitalization**
+- **No chunky or incorrect partial transcriptions**
+
+**Coming Soon:** A parallel version using Vosk for true real-time streaming transcription is in development.
 
 ## Key Features
 
-- **🚀 GPU Accelerated**: CUDA support for NVIDIA RTX 3050 and similar GPUs
-- **📦 Single Executable**: Native AOT compilation (~150MB standalone binary)
+- **🎤 Push-to-Talk Interface**: Hold F9 to record, release to transcribe
+- **🚀 GPU Accelerated**: CUDA support for NVIDIA GPUs
 - **🎯 Local Processing**: No cloud dependencies, all transcription happens locally
-- **⚡ Real-time Performance**: 5-10x real-time transcription speed with GPU
-- **🎮 System Tray UI**: Avalonia-based desktop interface with system tray integration
-- **🔧 Model Management**: Built-in Whisper model download and configuration
+- **📝 Direct Text Input**: Types transcribed text at cursor position in any application
+- **🎮 System Tray Application**: Runs quietly in background with settings window
+- **🔧 Model Selection**: Choose from Tiny, Base, Small, or Medium Whisper models
 
 ____
 
@@ -25,31 +46,40 @@ ____
 | Component | Technology |
 |-----------|------------|
 | **Language** | F# (.NET 10) |
-| **UI Framework** | Avalonia + ReactiveElmish |
-| **GPU Support** | CUDA 12 / DirectML fallback |
-| **Voice Engine** | Whisper.net (whisper.cpp bindings) |
-| **Architecture** | Native AOT with TensorPrimitives optimization |
-| **Target Hardware** | NVIDIA RTX 3050 (8GB VRAM) |
+| **UI Framework** | Avalonia 11 |
+| **GPU Support** | CUDA 12 via Whisper.NET |
+| **Voice Engine** | Whisper.NET (whisper.cpp bindings) |
+| **Transcription Mode** | Batch processing (push-to-talk) |
+| **Target Hardware** | NVIDIA RTX GPUs |
+
+## How It Works
+
+1. **Hold F9**: Start recording audio
+2. **Speak**: Your speech is buffered locally
+3. **Release F9**: Audio is sent to Whisper for transcription
+4. **Text appears**: Transcribed text is typed at your cursor position
+
+This batch lacks the "smoothness" of multi-threaded streaming transcription like most expect due to phone VTT behavior that's commonplace. This approach is based on whisper model behavior that uses this approach to ensure accurate transcription.
 
 ## Quick Start
 
 ### Prerequisites
 - .NET 10 SDK (RC1 or later)
-- NVIDIA GPU with CUDA 12 support (driver 581.29+)
-- Windows 11 Pro or compatible Linux distribution
+- NVIDIA GPU with CUDA support (optional but recommended)
+- Windows 10/11
 
 ### Build & Run
 ```bash
 # Clone and restore dependencies
-git clone https://github.com/your-repo/Mel.git
+git clone https://github.com/your-repo/SpeakEZ.git
 cd Mel
 dotnet restore
 
-# Build native executable
-dotnet publish -c Release -r win-x64 --self-contained
+# Build and run in debug mode
+./run-debug.ps1
 
-# Run the service
-./bin/Release/net10.0/win-x64/publish/Mel.exe
+# Or build for release
+dotnet publish -c Release -r win-x64 --self-contained
 ```
 
 ## Architecture Overview
@@ -127,17 +157,9 @@ img/
 
 ## Configuration
 
-### GPU Settings
-- **CUDA Acceleration**: Enabled by default for encoder layers
-- **CPU Threads**: Configurable for decoder performance (default: 8)
-- **Model Selection**: Base model recommended for RTX 3050
-
-### Audio Settings
-- **Sample Rate**: 16kHz (optimal for Whisper)
-- **Voice Activity Detection**: Configurable thresholds
-- **Buffer Size**: 4096 samples default
-
 ## Hardware 
+
+Right now the support is pretty "skinny" as it was an experiment to see whether this approach would work *at all*. So with this proof in place, other experiments with true multi-threaded text transcription (via Vosk) will take place. Once that's "in the can" then multi-platform support will be rolled out.
 
 **Optimized for NVIDIA RTX 3050:**
 - 2560 CUDA cores for encoder acceleration
@@ -156,4 +178,3 @@ Mel is designed as an interim solution for voice to text (VTT). Contributions we
 ## License
 
 MIT License - See LICENSE file for details.
-
