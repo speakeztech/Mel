@@ -6,7 +6,6 @@ open Avalonia.Controls
 open Avalonia.Layout
 open Avalonia.Media
 open Avalonia.Threading
-open Whisper.net.Ggml
 
 type SettingsWindow() as this =
     inherit Window()
@@ -132,16 +131,14 @@ type SettingsWindow() as this =
         
         let modelComboBox = ComboBox()
         modelComboBox.HorizontalAlignment <- HorizontalAlignment.Stretch
-        // Add available models
+        // Add available Vosk models
         let models = [
-            "Tiny (39 MB)"
-            "Base (142 MB)"
-            "Small (466 MB)"
-            "Medium (1.5 GB)"
+            "Small English (40 MB)"
+            "Large English (1.8 GB)"
         ]
         for model in models do
             modelComboBox.Items.Add(model) |> ignore
-        modelComboBox.SelectedIndex <- 1 // Default to Base
+        modelComboBox.SelectedIndex <- 0 // Default to Small for low latency
         modelCombo <- Some modelComboBox
         modelSelectPanel.Children.Add(modelComboBox)
         
@@ -331,12 +328,10 @@ type SettingsWindow() as this =
         match modelCombo with
         | Some combo -> 
             match combo.SelectedIndex with
-            | 0 -> GgmlType.Tiny
-            | 1 -> GgmlType.Base
-            | 2 -> GgmlType.Small
-            | 3 -> GgmlType.Medium
-            | _ -> GgmlType.Base
-        | None -> GgmlType.Base
+            | 0 -> "small-en"
+            | 1 -> "en"
+            | _ -> "small-en"
+        | None -> "small-en"
     
     member this.SetSpeechDetected(detected: bool) =
         match speechIndicator with

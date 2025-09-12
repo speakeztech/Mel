@@ -9,9 +9,8 @@
   </PropertyGroup>
 
   <ItemGroup>
-    <PackageReference Include="Whisper.net" Version="1.7.0" />
-    <PackageReference Include="Whisper.net.Runtime" Version="1.7.0" />
-    <PackageReference Include="Whisper.net.Runtime.Cuda" Version="1.7.0" />
+    <PackageReference Include="Vosk" Version="0.3.38" />
+    <PackageReference Include="Newtonsoft.Json" Version="13.0.3" />
     <PackageReference Include="Microsoft.Extensions.Hosting" Version="10.0.0-rc.1.25451.107" />
     <PackageReference Include="Microsoft.Extensions.Hosting.WindowsServices" Version="10.0.0-rc.1.25451.107" />
     <PackageReference Include="Microsoft.Extensions.Logging" Version="10.0.0-rc.1.25451.107" />
@@ -25,14 +24,14 @@
     <Compile Include="Audio\AudioTypes.fs" />
     <Compile Include="Audio\VAD.fs" />
     <Compile Include="Audio\Capture.fs" />
-    <Compile Include="Transcription\WhisperTypes.fs" />
-    <Compile Include="Transcription\Whisper.fs" />
+    <Compile Include="Transcription\VoskTypes.fs" />
+    <Compile Include="Transcription\Vosk.fs" />
     <Compile Include="Service\ServiceTypes.fs" />
     <Compile Include="Service\Host.fs" />
   </ItemGroup>
 
   <ItemGroup>
-    <TrimmerRootAssembly Include="Whisper.net" />
+    <TrimmerRootAssembly Include="Vosk" />
     <TrimmerRootAssembly Include="NAudio" />
   </ItemGroup>
 </Project>

@@ -12,10 +12,9 @@ open NAudio.CoreAudioApi
 open Mel.Core.Audio
 open Mel.Core.Audio.VAD
 open Mel.Core.Audio.Capture
-open Mel.Core.Transcription
-open Mel.Core.Transcription.Whisper
+open Mel.Core.Transcription.VoskTypes
+open Mel.Core.Transcription.Vosk
 open Mel.Core.Service
-open Whisper.net.Ggml
 
 // Windows API for sending keystrokes and hotkeys
 module WinApi =
@@ -89,7 +88,7 @@ type SpeakEZApp() =
     let mutable audioCapture: IAudioCapture option = None
     let mutable selectedDeviceIndex = 0
     let mutable vad: VoiceActivityDetector option = None
-    let mutable whisperTranscriber: IWhisperTranscriber option = None
+    let mutable voskTranscriber: IVoskTranscriber option = None
     let mutable recordingThread: Thread option = None
     let mutable audioBuffer = ResizeArray<float32>()
     let mutable statusMenuItem: NativeMenuItem option = None
@@ -185,7 +184,26 @@ type SpeakEZApp() =
         | Some window -> window.UpdateLevel(dbLevel)
         | None -> ()
         
-        // Recording state is handled by VAD processing below
+        // Stream audio to Vosk if recording
+        if isRecording then
+            match voskTranscriber with
+            | Some transcriber ->
+                // Process audio in real-time
+                match transcriber.ProcessAudio(frame.Samples) with
+                | Some partial ->
+                    // Update UI with partial transcription immediately
+                    match settingsWindow with
+                    | Some window -> 
+                        window.SetTranscription($"[Live] {partial.Partial}")
+                    | None -> ()
+                    
+                    // Type out new text incrementally
+                    if partial.Partial.Length > 0 then
+                        log $"📝 Streaming: '{partial.Partial}'"
+                        // In a real implementation, we'd track what's already typed
+                        // For now, we'll update the display only
+                | None -> ()
+            | None -> ()
         
         // Process with VAD
         match vad with
@@ -216,46 +234,16 @@ type SpeakEZApp() =
                     audioBuffer.RemoveRange(0, excess)
                 
             | SpeechEnded duration ->
-                log $"🔇 Speech ended after {duration.TotalSeconds:F1}s - transcribing..."
+                log $"🔇 Speech ended after {duration.TotalSeconds:F1}s"
                 
                 // Update settings window
                 match settingsWindow with
                 | Some window -> window.SetSpeechDetected(false)
                 | None -> ()
                 
-                if audioBuffer.Count > 8000 then // At least 0.5 seconds
-                    let samples = audioBuffer.ToArray()
-                    audioBuffer.Clear()
-                    
-                    // Transcribe asynchronously
-                    async {
-                        try
-                            match whisperTranscriber with
-                            | Some transcriber ->
-                                log $"Sending {samples.Length} samples to Whisper..."
-                                let! result = transcriber.TranscribeAsync(samples, 16000)
-                                if not (String.IsNullOrWhiteSpace(result.FullText)) then
-                                    log $"✅ Transcribed: '{result.FullText}'"
-                                    
-                                    // Update settings window
-                                    match settingsWindow with
-                                    | Some window -> window.SetTranscription(result.FullText)
-                                    | None -> ()
-                                    
-                                    // Type the text at cursor on UI thread with trailing space
-                                    Avalonia.Threading.Dispatcher.UIThread.Post(fun () ->
-                                        typeText (result.FullText + " ")
-                                    )
-                                else
-                                    ()  // Silent on empty result
-                            | None -> 
-                                log "❌ Transcriber not initialized"
-                        with
-                        | ex -> 
-                            log $"❌ Transcription error: {ex.Message}"
-                            if ex.InnerException <> null then
-                                log $"Inner exception: {ex.InnerException.Message}"
-                    } |> Async.Start
+                // With Vosk streaming, transcription happens in real-time
+                // No need to process here - it's already been streamed
+                audioBuffer.Clear()
         | None -> ()
     
     let rec updateMenuStatus() =
@@ -276,7 +264,12 @@ type SpeakEZApp() =
             // Clear audio buffer for new recording
             audioBuffer.Clear()
             
-            // Don't clear buffer - we want to keep pre-speech audio
+            // Start Vosk streaming session
+            match voskTranscriber with
+            | Some transcriber ->
+                transcriber.StartStream()
+                log "Started Vosk streaming session"
+            | None -> ()
             
             // Initialize audio capture if needed (on main thread first)
             if audioCapture.IsNone then
@@ -341,38 +334,31 @@ type SpeakEZApp() =
             isRecording <- false
             updateMenuStatus()
             
-            // Transcribe the buffered audio
-            if audioBuffer.Count > 8000 then // At least 0.5 seconds
-                let samples = audioBuffer.ToArray()
+            // Finish Vosk stream and get final result
+            match voskTranscriber with
+            | Some transcriber ->
+                match transcriber.FinishStream() with
+                | Some final ->
+                    if not (String.IsNullOrWhiteSpace(final.Text)) then
+                        let finalText = final.Text.Trim()
+                        log $"✅ Final transcription: '{finalText}'"
+                        
+                        // Update settings window
+                        match settingsWindow with
+                        | Some window -> window.SetTranscription(finalText)
+                        | None -> ()
+                        
+                        // Type the final text with trailing space
+                        Avalonia.Threading.Dispatcher.UIThread.Post(fun () ->
+                            typeText (finalText + " ")
+                        )
+                | None ->
+                    log "No final transcription available"
                 
-                // Transcribe asynchronously
-                async {
-                    try
-                        match whisperTranscriber with
-                        | Some transcriber ->
-                            log $"Transcribing {samples.Length} samples..."
-                            let! result = transcriber.TranscribeAsync(samples, 16000)
-                            if not (String.IsNullOrWhiteSpace(result.FullText)) then
-                                let finalText = result.FullText.Trim()
-                                log $"✅ Transcribed: '{finalText}'"
-                                
-                                // Update settings window
-                                match settingsWindow with
-                                | Some window -> window.SetTranscription(finalText)
-                                | None -> ()
-                                
-                                // Type the text at cursor with trailing space
-                                Avalonia.Threading.Dispatcher.UIThread.Post(fun () ->
-                                    typeText (finalText + " ")
-                                )
-                        | None -> 
-                            log "❌ Transcriber not initialized"
-                    with
-                    | ex -> 
-                        log $"❌ Transcription error: {ex.Message}"
-                        if ex.InnerException <> null then
-                            log $"Inner exception: {ex.InnerException.Message}"
-                } |> Async.Start
+                // Reset for next session
+                transcriber.Reset()
+            | None -> 
+                log "❌ Transcriber not initialized"
             
             // Clear speech indicator
             match settingsWindow with
@@ -426,34 +412,33 @@ type SpeakEZApp() =
                 try
                     log "Starting deferred initialization..."
                     
-                    // Initialize Whisper (this might download model)
-                    log "Initializing Whisper transcriber..."
+                    // Initialize Vosk for streaming transcription
+                    log "Initializing Vosk transcriber..."
                     
-                    // Use Base model by default
-                    let modelType = GgmlType.Base
-                    let modelName = "base"
+                    // Use small English model for low latency
+                    let modelName = "vosk-model-small-en-us-0.15"
                     
                     let config = {
-                        ModelPath = $"./models/ggml-{modelName}.bin"
-                        ModelType = modelType
-                        Language = "en"
-                        UseGpu = true
-                        ThreadCount = 4
-                        MaxSegmentLength = 30
-                        EnableTranslate = false
+                        ModelPath = $"./models/{modelName}"
+                        SampleRate = 16000.0f
+                        MaxAlternatives = 0
+                        Words = false  // Don't need word-level timing for now
+                        PartialWords = false
                     }
                     
                     try
-                        log $"Using Whisper model: {modelName} at {config.ModelPath}"
+                        log $"Using Vosk model: {modelName}"
                         
-                        // Check if model exists
-                        if not (System.IO.File.Exists(config.ModelPath)) then
-                            log $"Model file not found, will download on first use"
-                        
-                        whisperTranscriber <- Some (new WhisperTranscriber(config) :> IWhisperTranscriber)
-                        log "Whisper initialized successfully"
+                        // Check if model directory exists
+                        if not (System.IO.Directory.Exists(config.ModelPath)) then
+                            log $"Model directory not found at {config.ModelPath}"
+                            log "Please download from: https://alphacephei.com/vosk/models/vosk-model-small-en-us-0.15.zip"
+                            log "And extract to ./models/ directory"
+                        else
+                            voskTranscriber <- Some (new VoskTranscriber(config) :> IVoskTranscriber)
+                            log "Vosk initialized successfully for streaming"
                     with ex ->
-                        log $"WARNING: Whisper initialization failed: {ex.Message}"
+                        log $"WARNING: Vosk initialization failed: {ex.Message}"
                         log "Transcription will not be available"
                     
                     // Initialize VAD

@@ -1,7 +1,7 @@
 namespace Mel.Core.Service
 
 open System
-open Mel.Core.Transcription
+open Mel.Core.Transcription.VoskTypes
 
 type ServiceStatus =
     | Idle
@@ -10,7 +10,7 @@ type ServiceStatus =
     | Error of string
 
 type ServiceConfig = {
-    WhisperConfig: WhisperConfig
+    VoskConfig: VoskConfig
     VADConfig: Mel.Core.Audio.VADConfig
     AudioDeviceIndex: int
     BufferSize: int
