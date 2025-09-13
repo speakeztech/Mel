@@ -78,7 +78,16 @@ module WinApi =
     
     [<DllImport("user32.dll")>]
     extern int16 GetAsyncKeyState(int vKey)
-    
+
+// Ring buffer for streaming text with correction capability
+type TextBuffer = {
+    mutable Buffer: string        // Current complete text in buffer
+    mutable Committed: int        // Characters already typed to screen
+    mutable Pending: string       // Text waiting to be typed
+    mutable LastUpdate: DateTime  // When buffer was last updated
+    mutable Alternatives: (string * float32) list  // Alternative transcriptions with confidence
+    mutable CorrectionHistory: Map<string, string>  // User corrections for learning
+}
 
 type SpeakEZApp() =
     inherit Application()
@@ -95,8 +104,20 @@ type SpeakEZApp() =
     let mutable levelMenuItem: NativeMenuItem option = None
     let mutable deviceMenuItem: NativeMenuItem option = None
     
-    // Simple push-to-talk state
-    // audioBuffer already defined above for VAD processing
+    // Create text buffer instance
+    let textBuffer = {
+        Buffer = ""
+        Committed = 0
+        Pending = ""
+        LastUpdate = DateTime.UtcNow
+        Alternatives = []
+        CorrectionHistory = Map.empty
+    }
+    
+    let mutable sentenceStart = true
+    let mutable streamStartTime = DateTime.UtcNow
+    let minStreamDelay = 0.3  // Wait before typing to avoid false starts
+    let commitDelay = 0.5     // Wait before committing text as final
     
     let mutable logHistory = ResizeArray<string>()
     let logEvent = Event<string>()
@@ -132,6 +153,85 @@ type SpeakEZApp() =
             log $"Error enumerating audio devices: {ex.Message}"
             []
     
+    let backspaceCharacters (count: int) =
+        // Backspace the specified number of characters
+        if count > 0 then
+            try
+                let simulator = WindowsInput.InputSimulator()
+                for i in 1 .. count do
+                    simulator.Keyboard.KeyPress(WindowsInput.Native.VirtualKeyCode.BACK) |> ignore
+                log $"Backspaced {count} characters"
+            with
+            | ex -> log $"Error backspacing: {ex.Message}"
+    
+    let rec typeText (text: string) =
+        // Type the text at current cursor position using InputSimulator
+        try
+            let simulator = WindowsInput.InputSimulator()
+            simulator.Keyboard.TextEntry(text) |> ignore
+            log $"Typed text: {text}"
+        with ex ->
+            log $"Failed to type text: {ex.Message}"
+    
+    // Process text for punctuation commands and capitalization
+    and interpretText (text: string) =
+        let mutable result = text
+        
+        // Replace spoken punctuation commands
+        result <- result.Replace(" comma", ",")
+                        .Replace(" period", ".")
+                        .Replace(" question mark", "?")
+                        .Replace(" exclamation mark", "!")
+                        .Replace(" exclamation point", "!")
+                        
+        // Capitalize first letter if at sentence start
+        if sentenceStart && result.Length > 0 then
+            result <- System.Char.ToUpper(result.[0]).ToString() + 
+                     (if result.Length > 1 then result.Substring(1) else "")
+            sentenceStart <- false
+            
+        // Check if we ended a sentence
+        if result.EndsWith(".") || result.EndsWith("?") || result.EndsWith("!") then
+            sentenceStart <- true
+            result <- result + " "  // Add space after sentence
+        
+        result
+    
+    // Process streaming text with conservative approach - no backspacing
+    and processStreamBuffer(newText: string) =
+        if newText = textBuffer.Buffer then
+            ()  // No change
+        else
+            let timeSinceStart = (DateTime.UtcNow - streamStartTime).TotalSeconds
+            textBuffer.Buffer <- newText
+            textBuffer.LastUpdate <- DateTime.UtcNow
+            
+            // Wait for stable text before typing
+            if timeSinceStart < minStreamDelay then
+                ()  // Too early, don't type yet
+            elif textBuffer.Committed = 0 || (newText.Length > textBuffer.Committed) then
+                // Check if we can type new text
+                if textBuffer.Committed = 0 then
+                    // First text - type it if stable
+                    if newText.Length > 0 && timeSinceStart > minStreamDelay then
+                        let toType = interpretText newText
+                        Avalonia.Threading.Dispatcher.UIThread.Post(fun () ->
+                            typeText toType
+                        )
+                        textBuffer.Committed <- newText.Length
+                else
+                    // Try to extend existing text (no corrections)
+                    let committedText = textBuffer.Buffer.Substring(0, min textBuffer.Committed textBuffer.Buffer.Length)
+                    if newText.StartsWith(committedText) then
+                        let extension = newText.Substring(textBuffer.Committed)
+                        if extension.Length > 0 then
+                            let toType = interpretText extension
+                            Avalonia.Threading.Dispatcher.UIThread.Post(fun () ->
+                                typeText toType
+                            )
+                            textBuffer.Committed <- newText.Length
+            // If text changed completely, don't try to correct - just wait for final
+    
     let typeText (text: string) =
         // Type the text at current cursor position using InputSimulator
         try
@@ -140,6 +240,7 @@ type SpeakEZApp() =
             log $"Typed text: {text}"
         with
         | ex -> log $"Error typing text: {ex.Message}"
+    
     
     let calculateRMS (samples: float32[]) =
         if samples = null || samples.Length = 0 then 
@@ -197,11 +298,10 @@ type SpeakEZApp() =
                         window.SetTranscription($"[Live] {partial.Partial}")
                     | None -> ()
                     
-                    // Type out new text incrementally
+                    // Process through ring buffer
                     if partial.Partial.Length > 0 then
                         log $"📝 Streaming: '{partial.Partial}'"
-                        // In a real implementation, we'd track what's already typed
-                        // For now, we'll update the display only
+                        processStreamBuffer(partial.Partial)
                 | None -> ()
             | None -> ()
         
@@ -263,6 +363,16 @@ type SpeakEZApp() =
             
             // Clear audio buffer for new recording
             audioBuffer.Clear()
+            
+            // Reset buffer state
+            textBuffer.Buffer <- ""
+            textBuffer.Committed <- 0
+            textBuffer.Pending <- ""
+            textBuffer.LastUpdate <- DateTime.UtcNow
+            textBuffer.Alternatives <- []
+            sentenceStart <- true
+            streamStartTime <- DateTime.UtcNow
+            
             
             // Start Vosk streaming session
             match voskTranscriber with
@@ -334,6 +444,8 @@ type SpeakEZApp() =
             isRecording <- false
             updateMenuStatus()
             
+            // Stop any pending timer
+            
             // Finish Vosk stream and get final result
             match voskTranscriber with
             | Some transcriber ->
@@ -348,12 +460,23 @@ type SpeakEZApp() =
                         | Some window -> window.SetTranscription(finalText)
                         | None -> ()
                         
-                        // Type the final text with trailing space
-                        Avalonia.Threading.Dispatcher.UIThread.Post(fun () ->
-                            typeText (finalText + " ")
-                        )
+                        // Handle final text through buffer
+                        if finalText <> textBuffer.Buffer then
+                            // Final differs from stream - update buffer with correction
+                            log $"Stream correction: '{textBuffer.Buffer}' -> '{finalText}'"
+                            processStreamBuffer(finalText)
+                        
+                        // Add final space
+                        if textBuffer.Committed > 0 then
+                            Avalonia.Threading.Dispatcher.UIThread.Post(fun () ->
+                                typeText " "
+                            )
                 | None ->
-                    log "No final transcription available"
+                    // Just add a space if we typed something
+                    if textBuffer.Committed > 0 then
+                        Avalonia.Threading.Dispatcher.UIThread.Post(fun () ->
+                            typeText " "
+                        )
                 
                 // Reset for next session
                 transcriber.Reset()

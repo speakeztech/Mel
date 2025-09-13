@@ -9,7 +9,11 @@
       "Bash(git checkout:*)",
       "Bash(git branch:*)",
       "Bash(git switch:*)",
-      "WebSearch"
+      "WebSearch",
+      "Bash(git log:*)",
+      "Bash(git ls-tree:*)",
+      "Bash(git archive:*)",
+      "Bash(tar:*)"
     ],
     "deny": [],
     "ask": []
