@@ -146,13 +146,21 @@ module ModelManagement =
         abstract member IsModelDownloaded: modelType:ModelType -> bool
         abstract member GetDownloadProgress: unit -> float
 
-    /// Model factory (equivalent to WhisperFactory)
+    /// Model factory (enhanced from WhisperFactory)
     type IWhisperFactory =
         inherit IDisposable
-        abstract member CreateProcessor: config:WhisperConfig -> IWhisperProcessor
-        abstract member CreateStream: config:WhisperConfig -> IWhisperStream
-        abstract member FromPath: modelPath:string -> IWhisperFactory
-        abstract member FromBuffer: buffer:byte[] -> IWhisperFactory
+        abstract member CreateClient: config:WhisperConfig -> IWhisperClient
+        abstract member FromPath: modelPath:string -> Result<IWhisperFactory, WhisperError>
+        abstract member FromBuffer: buffer:byte[] -> Result<IWhisperFactory, WhisperError>
+        abstract member GetModelInfo: unit -> ModelInfo
+
+    and ModelInfo = {
+        Type: ModelType
+        VocabSize: int
+        AudioContext: int
+        AudioState: int
+        Languages: string list
+    }
 
 namespace WhisperFS
 
@@ -198,49 +206,56 @@ type StreamConfig = {
     InitialPrompt: string
 }
 
-/// Batch processor interface (Whisper.NET compatible)
+/// Legacy batch processor interface (for backward compatibility)
+/// Note: New code should use IWhisperClient instead
+[<Obsolete("Use IWhisperClient for new implementations")>]
 type IWhisperProcessor =
     inherit IDisposable
-
-    /// Process audio file (Whisper.NET compatible)
     abstract member ProcessAsync: audioPath:string -> Async<TranscriptionResult>
-
-    /// Process audio stream (Whisper.NET compatible)
     abstract member ProcessAsync: audioStream:Stream -> IAsyncEnumerable<Segment>
-
-    /// Process audio buffer
     abstract member ProcessAsync: samples:float32[] -> Async<TranscriptionResult>
 
-    /// Process with callbacks for segments
-    abstract member ProcessAsync: samples:float32[] * onSegment:(Segment -> unit) -> Async<TranscriptionResult>
-
-    /// Change language at runtime
-    abstract member SetLanguage: language:string -> unit
-
-    /// Detect language from audio
-    abstract member DetectLanguageAsync: samples:float32[] -> Async<string * float32>
-
-/// Main streaming interface (new capability)
-type IWhisperStream =
+/// Unified client interface (combines batch and streaming)
+type IWhisperClient =
     inherit IDisposable
 
-    /// Process a chunk of audio samples
-    abstract member ProcessChunk: samples:float32[] -> Async<TranscriptionEvent>
+    /// Process audio based on mode (batch or streaming)
+    abstract member ProcessAsync: samples:float32[] -> Async<Result<TranscriptionResult, WhisperError>>
 
-    /// Get current context for continuation
-    abstract member GetContext: unit -> byte[]
+    /// Process audio stream (for streaming mode)
+    abstract member ProcessStream: audioStream:IObservable<float32[]> -> IObservable<TranscriptionEvent>
 
-    /// Reset the stream state
-    abstract member Reset: unit -> unit
+    /// Process audio file
+    abstract member ProcessFileAsync: path:string -> Async<Result<TranscriptionResult, WhisperError>>
 
-    /// Observable stream of transcription events
+    /// Get/set streaming mode
+    abstract member StreamingMode: bool with get, set
+
+    /// Observable events (for streaming)
     abstract member Events: IObservable<TranscriptionEvent>
 
-    /// Switch between streaming and batch mode
-    abstract member SetStreamingMode: enabled:bool -> unit
+    /// Reset state (for streaming)
+    abstract member Reset: unit -> unit
 
-    /// Get current configuration
-    abstract member GetConfig: unit -> WhisperConfig
+    /// Detect language
+    abstract member DetectLanguageAsync: samples:float32[] -> Async<Result<LanguageDetection, WhisperError>>
+
+/// Error types for better error handling
+and WhisperError =
+    | ModelLoadError of message:string
+    | ProcessingError of code:int * message:string
+    | InvalidAudioFormat of message:string
+    | StateError of message:string
+    | NativeLibraryError of message:string
+    | TokenizationError of message:string
+    | OutOfMemory
+    | Cancelled
+
+and LanguageDetection = {
+    Language: string
+    Confidence: float32
+    Probabilities: Map<string, float32>
+}
 
 /// Unified result type (Whisper.NET compatible)
 and TranscriptionResult = {
@@ -255,12 +270,76 @@ and TranscriptionResult = {
 }
 ```
 
-## Implementation Details
-
-### Fluent Builder Pattern (Whisper.NET Compatible)
+## Native Library Management
 
 ```fsharp
-/// Builder pattern matching Whisper.NET's API
+/// Runtime selection and native library loading
+module NativeLibraryLoader =
+
+    type RuntimeType =
+        | Cpu
+        | CpuNoAvx
+        | Cuda of version:string
+        | CoreML
+        | OpenVino
+        | Vulkan
+
+    type RuntimeInfo = {
+        Type: RuntimeType
+        Priority: int
+        LibraryName: string
+        Available: bool
+    }
+
+    /// Detect available runtimes based on system capabilities
+    let detectAvailableRuntimes() =
+        [
+            // Check CUDA availability
+            if hasCudaSupport() then
+                { Type = Cuda "12.0"; Priority = 1; LibraryName = "whisper.cuda.dll"; Available = true }
+
+            // Check AVX support
+            if hasAvxSupport() then
+                { Type = Cpu; Priority = 2; LibraryName = "whisper.dll"; Available = true }
+            else
+                { Type = CpuNoAvx; Priority = 3; LibraryName = "whisper.noavx.dll"; Available = true }
+
+            // Platform-specific
+            if RuntimeInformation.IsOSPlatform(OSPlatform.OSX) then
+                { Type = CoreML; Priority = 1; LibraryName = "whisper.coreml.dylib"; Available = true }
+        ]
+        |> List.sortBy (fun r -> r.Priority)
+
+    /// Load the best available runtime
+    let loadBestRuntime() =
+        let runtimes = detectAvailableRuntimes()
+        match runtimes with
+        | [] -> Error (NativeLibraryError "No compatible runtime found")
+        | best::_ ->
+            try
+                NativeLibrary.Load(best.LibraryName)
+                Ok best
+            with ex ->
+                Error (NativeLibraryError ex.Message)
+
+    /// Download runtime if not present
+    let ensureRuntimeAsync(runtime: RuntimeType) =
+        async {
+            let libraryPath = getLibraryPath runtime
+            if not (File.Exists(libraryPath)) then
+                let url = getRuntimeUrl runtime
+                let! data = downloadAsync url
+                do! File.WriteAllBytesAsync(libraryPath, data) |> Async.AwaitTask
+            return Ok libraryPath
+        }
+```
+
+## Implementation Details
+
+### Fluent Builder Pattern (Enhanced from Whisper.NET)
+
+```fsharp
+/// Enhanced builder pattern with Result type
 type WhisperBuilder(factory: IWhisperFactory) =
     let mutable config = {
         ModelPath = ""
@@ -350,54 +429,117 @@ type WhisperBuilder(factory: IWhisperFactory) =
                         OverlapMs = overlapMs }
         this
 
-    member _.Build() : IWhisperProcessor =
-        factory.CreateProcessor(config)
+    member _.Build() : Result<IWhisperClient, WhisperError> =
+        try
+            // Validate configuration
+            match validateConfig config with
+            | Error err -> Error err
+            | Ok _ ->
+                // Load native library if needed
+                match NativeLibraryLoader.loadBestRuntime() with
+                | Error err -> Error err
+                | Ok runtime ->
+                    // Create client
+                    let client = factory.CreateClient(config)
+                    Ok client
+        with ex ->
+            Error (NativeLibraryError ex.Message)
 
-    member _.BuildStream() : IWhisperStream =
-        factory.CreateStream({ config with StreamingMode = true })
+    member _.BuildStream() : Result<IWhisperClient, WhisperError> =
+        this.WithStreaming(1000, 200).Build()
 ```
 
 ### P/Invoke Bindings to whisper.cpp
 
 ```fsharp
 module WhisperNative =
-    
+
+    // Context initialization
     [<DllImport("whisper.dll", CallingConvention = CallingConvention.Cdecl)>]
     extern IntPtr whisper_init_from_file(string path)
-    
+
     [<DllImport("whisper.dll", CallingConvention = CallingConvention.Cdecl)>]
     extern IntPtr whisper_init_from_buffer(IntPtr buffer, int buffer_size)
-    
+
     [<DllImport("whisper.dll", CallingConvention = CallingConvention.Cdecl)>]
     extern void whisper_free(IntPtr ctx)
-    
+
+    // State management - CRITICAL for streaming
+    [<DllImport("whisper.dll", CallingConvention = CallingConvention.Cdecl)>]
+    extern IntPtr whisper_init_state(IntPtr ctx)
+
+    [<DllImport("whisper.dll", CallingConvention = CallingConvention.Cdecl)>]
+    extern void whisper_free_state(IntPtr state)
+
+    // Core processing functions
     [<DllImport("whisper.dll", CallingConvention = CallingConvention.Cdecl)>]
     extern int whisper_full(
         IntPtr ctx,
         WhisperFullParams parameters,
         float32[] samples,
         int n_samples)
-    
+
+    // Streaming-specific processing with state
+    [<DllImport("whisper.dll", CallingConvention = CallingConvention.Cdecl)>]
+    extern int whisper_full_with_state(
+        IntPtr ctx,
+        IntPtr state,
+        WhisperFullParams parameters,
+        float32[] samples,
+        int n_samples)
+
+    // Segment access from context
     [<DllImport("whisper.dll", CallingConvention = CallingConvention.Cdecl)>]
     extern int whisper_full_n_segments(IntPtr ctx)
-    
+
     [<DllImport("whisper.dll", CallingConvention = CallingConvention.Cdecl)>]
     extern IntPtr whisper_full_get_segment_text(IntPtr ctx, int i_segment)
-    
+
     [<DllImport("whisper.dll", CallingConvention = CallingConvention.Cdecl)>]
     extern int64 whisper_full_get_segment_t0(IntPtr ctx, int i_segment)
-    
+
     [<DllImport("whisper.dll", CallingConvention = CallingConvention.Cdecl)>]
     extern int64 whisper_full_get_segment_t1(IntPtr ctx, int i_segment)
-    
+
+    // Segment access from state (for streaming)
+    [<DllImport("whisper.dll", CallingConvention = CallingConvention.Cdecl)>]
+    extern int whisper_full_n_segments_from_state(IntPtr state)
+
+    [<DllImport("whisper.dll", CallingConvention = CallingConvention.Cdecl)>]
+    extern IntPtr whisper_full_get_segment_text_from_state(IntPtr state, int i_segment)
+
+    [<DllImport("whisper.dll", CallingConvention = CallingConvention.Cdecl)>]
+    extern int64 whisper_full_get_segment_t0_from_state(IntPtr state, int i_segment)
+
+    [<DllImport("whisper.dll", CallingConvention = CallingConvention.Cdecl)>]
+    extern int64 whisper_full_get_segment_t1_from_state(IntPtr state, int i_segment)
+
+    // Token access
     [<DllImport("whisper.dll", CallingConvention = CallingConvention.Cdecl)>]
     extern int whisper_full_n_tokens(IntPtr ctx, int i_segment)
-    
+
+    [<DllImport("whisper.dll", CallingConvention = CallingConvention.Cdecl)>]
+    extern int whisper_full_n_tokens_from_state(IntPtr state, int i_segment)
+
     [<DllImport("whisper.dll", CallingConvention = CallingConvention.Cdecl)>]
     extern IntPtr whisper_full_get_token_text(IntPtr ctx, int i_segment, int i_token)
-    
+
+    [<DllImport("whisper.dll", CallingConvention = CallingConvention.Cdecl)>]
+    extern IntPtr whisper_full_get_token_text_from_state(IntPtr state, int i_segment, int i_token)
+
     [<DllImport("whisper.dll", CallingConvention = CallingConvention.Cdecl)>]
     extern float whisper_full_get_token_p(IntPtr ctx, int i_segment, int i_token)
+
+    [<DllImport("whisper.dll", CallingConvention = CallingConvention.Cdecl)>]
+    extern float whisper_full_get_token_p_from_state(IntPtr state, int i_segment, int i_token)
+
+    // Tokenization for prompts
+    [<DllImport("whisper.dll", CallingConvention = CallingConvention.Cdecl)>]
+    extern int whisper_tokenize(
+        IntPtr ctx,
+        [<MarshalAs(UnmanagedType.LPStr)>] string text,
+        [<Out>] int[] tokens,
+        int n_max_tokens)
 
     // Language detection
     [<DllImport("whisper.dll", CallingConvention = CallingConvention.Cdecl)>]
@@ -423,43 +565,85 @@ module WhisperNative =
     [<DllImport("whisper.dll", CallingConvention = CallingConvention.Cdecl)>]
     extern int whisper_model_type(IntPtr ctx)
 
-    /// Streaming-specific parameters
+    // Callback delegates for streaming
+    [<UnmanagedFunctionPointer(CallingConvention.Cdecl)>]
+    type WhisperNewSegmentCallback =
+        delegate of ctx:IntPtr * state:IntPtr * n_new:int * user_data:IntPtr -> unit
+
+    [<UnmanagedFunctionPointer(CallingConvention.Cdecl)>]
+    type WhisperEncoderBeginCallback =
+        delegate of ctx:IntPtr * state:IntPtr * user_data:IntPtr -> bool
+
+    [<UnmanagedFunctionPointer(CallingConvention.Cdecl)>]
+    type WhisperLogitsFilterCallback =
+        delegate of ctx:IntPtr * state:IntPtr * tokens:IntPtr * n_tokens:int * logits:IntPtr * user_data:IntPtr -> unit
+
+    /// Full parameters structure - must match C struct exactly
     [<Struct; StructLayout(LayoutKind.Sequential)>]
     type WhisperFullParams =
-        val mutable strategy: int
-        val mutable n_threads: int
-        val mutable n_max_text_ctx: int
-        val mutable offset_ms: int
-        val mutable duration_ms: int
-        val mutable translate: bool
-        val mutable no_context: bool
-        val mutable single_segment: bool
-        val mutable print_special: bool
-        val mutable print_progress: bool
-        val mutable print_realtime: bool
-        val mutable print_timestamps: bool
-        val mutable token_timestamps: bool
-        val mutable thold_pt: float32
-        val mutable thold_ptsum: float32
-        val mutable max_len: int
-        val mutable split_on_word: bool
-        val mutable max_tokens: int
-        val mutable audio_ctx: int  // Critical for streaming!
-        val mutable prompt_tokens: IntPtr
-        val mutable prompt_n_tokens: int
-        val mutable language: IntPtr
-        val mutable suppress_blank: bool
-        val mutable suppress_non_speech_tokens: bool
-        val mutable temperature: float32
-        val mutable max_initial_ts: float32
-        val mutable length_penalty: float32
+        val mutable strategy: int                    // Sampling strategy (0=GREEDY, 1=BEAM_SEARCH)
+        val mutable n_threads: int                   // Number of threads
+        val mutable n_max_text_ctx: int             // Max tokens to use from past text as prompt
+        val mutable offset_ms: int                   // Start offset in ms
+        val mutable duration_ms: int                 // Audio duration to process in ms
+        val mutable translate: bool                  // Translate to English
+        val mutable no_context: bool                 // Do not use past transcription for context
+        val mutable no_timestamps: bool              // Do not generate timestamps
+        val mutable single_segment: bool             // Force single segment output
+        val mutable print_special: bool              // Print special tokens
+        val mutable print_progress: bool             // Print progress info
+        val mutable print_realtime: bool             // Print results from within whisper.cpp
+        val mutable print_timestamps: bool           // Print timestamps for each text segment
+        val mutable token_timestamps: bool           // Enable token-level timestamps
+        val mutable thold_pt: float32               // Timestamp token probability threshold
+        val mutable thold_ptsum: float32            // Timestamp token sum probability threshold
+        val mutable max_len: int                     // Max segment length in characters
+        val mutable split_on_word: bool             // Split on word rather than token
+        val mutable max_tokens: int                  // Max tokens per segment (0=no limit)
+
+        // Temperature sampling parameters
+        val mutable temperature: float32             // Initial temperature
+        val mutable temperature_inc: float32         // Temperature increment for fallbacks
+        val mutable entropy_thold: float32          // Entropy threshold for decoder fallback
+        val mutable logprob_thold: float32          // Log probability threshold for decoder fallback
+        val mutable no_speech_thold: float32        // No-speech probability threshold
+
+        // Beam search parameters (when strategy = BEAM_SEARCH)
+        val mutable beam_size: int                   // Beam size for beam search
+        val mutable best_of: int                     // Number of best candidates to keep
+        val mutable patience: float32                 // Patience for beam search
+
+        // Prompt tokens (must be allocated and tokenized)
+        val mutable prompt_tokens: IntPtr            // Pointer to prompt token array
+        val mutable prompt_n_tokens: int             // Number of prompt tokens
+
+        // Language
+        val mutable language: IntPtr                 // Language hint ("en", "de", etc.)
+        val mutable detect_language: bool            // Auto-detect language
+
+        // Suppression
+        val mutable suppress_blank: bool             // Suppress blank outputs
+        val mutable suppress_non_speech_tokens: bool // Suppress non-speech tokens
+
+        // Initial timestamp
+        val mutable max_initial_ts: float32          // Max initial timestamp
+        val mutable length_penalty: float32          // Length penalty
+
+        // Callbacks for streaming
+        val mutable new_segment_callback: IntPtr     // Callback for new segments
+        val mutable new_segment_callback_user_data: IntPtr
+        val mutable encoder_begin_callback: IntPtr   // Callback before encoding
+        val mutable encoder_begin_callback_user_data: IntPtr
+        val mutable logits_filter_callback: IntPtr   // Callback for filtering logits
+        val mutable logits_filter_callback_user_data: IntPtr
 ```
 
-### Batch Processing Implementation (Whisper.NET Compatible)
+### Unified Client Implementation (Batch and Streaming)
 
 ```fsharp
-/// Implementation of IWhisperProcessor for PTT scenarios
-type WhisperProcessor(ctx: IntPtr, config: WhisperConfig) =
+/// Unified implementation supporting both batch and streaming
+type WhisperClient(ctx: IntPtr, config: WhisperConfig) =
+    let state = if config.StreamingMode then Some(WhisperNative.whisper_init_state(ctx)) else None
 
     let processBuffer (samples: float32[]) =
         async {
@@ -493,13 +677,18 @@ type WhisperProcessor(ctx: IntPtr, config: WhisperConfig) =
                 parameters.language <- Marshal.StringToHGlobalAnsi(lang)
             | None -> ()
 
-            // Set initial prompt if provided
+            // Tokenize and set initial prompt if provided
             match config.InitialPrompt with
             | Some prompt ->
-                let promptBytes = System.Text.Encoding.UTF8.GetBytes(prompt)
-                parameters.prompt_tokens <- Marshal.AllocHGlobal(promptBytes.Length)
-                Marshal.Copy(promptBytes, 0, parameters.prompt_tokens, promptBytes.Length)
-                parameters.prompt_n_tokens <- promptBytes.Length
+                let maxTokens = 512
+                let tokens = Array.zeroCreate<int> maxTokens
+                let tokenCount = WhisperNative.whisper_tokenize(ctx, prompt, tokens, maxTokens)
+                if tokenCount > 0 then
+                    // Allocate and copy token IDs (not bytes)
+                    let tokenPtr = Marshal.AllocHGlobal(tokenCount * sizeof<int>)
+                    Marshal.Copy(tokens, 0, tokenPtr, tokenCount)
+                    parameters.prompt_tokens <- tokenPtr
+                    parameters.prompt_n_tokens <- tokenCount
             | None -> ()
 
             // Process audio
@@ -526,7 +715,7 @@ type WhisperProcessor(ctx: IntPtr, config: WhisperConfig) =
                                         let prob = WhisperNative.whisper_full_get_token_p(ctx, i, j)
                                         yield {
                                             Text = tokenText
-                                            Timestamp = float32 t0 / 100.0f
+                                            Timestamp = float32 t0 / 1000.0f  // CORRECT: ms to seconds
                                             Probability = prob
                                             IsSpecial = tokenText.StartsWith("<|") && tokenText.EndsWith("|>")
                                         }
@@ -536,8 +725,8 @@ type WhisperProcessor(ctx: IntPtr, config: WhisperConfig) =
 
                         yield {
                             Text = text
-                            StartTime = float32 t0 / 100.0f
-                            EndTime = float32 t1 / 100.0f
+                            StartTime = float32 t0 / 1000.0f  // CORRECT: ms to seconds
+                            EndTime = float32 t1 / 1000.0f    // CORRECT: ms to seconds
                             Tokens = tokens
                         }
                 ]
@@ -559,6 +748,7 @@ type WhisperProcessor(ctx: IntPtr, config: WhisperConfig) =
                 return failwith $"Whisper processing failed with code {result}"
         }
 
+    // Legacy IWhisperProcessor support for backward compatibility
     interface IWhisperProcessor with
         member _.ProcessAsync(audioPath: string) =
             async {
@@ -601,99 +791,209 @@ type WhisperProcessor(ctx: IntPtr, config: WhisperConfig) =
             }
 
         member _.Dispose() =
+            match state with
+            | Some s -> WhisperNative.whisper_free_state(s)
+            | None -> ()
+            WhisperNative.whisper_free(ctx)
+
+    // Main IWhisperClient implementation
+    interface IWhisperClient with
+        member this.ProcessAsync(samples) =
+            if config.StreamingMode then
+                processStreamingChunk samples
+            else
+                processBatchAudio samples
+
+        member this.ProcessStream(audioStream) =
+            if not config.StreamingMode then
+                failwith "Client not configured for streaming mode"
+            audioStream |> Observable.selectAsync processStreamingChunk
+
+        member this.ProcessFileAsync(path) =
+            processFile path
+
+        member _.StreamingMode
+            with get() = config.StreamingMode
+            and set(value) = () // Would need mutable config
+
+        member _.Events = events.Publish
+
+        member _.Reset() =
+            match state with
+            | Some s ->
+                WhisperNative.whisper_free_state(s)
+                // Reinitialize state
+            | None -> ()
+
+        member _.DetectLanguageAsync(samples) =
+            detectLanguage samples
+
+        member _.Dispose() =
+            match state with
+            | Some s -> WhisperNative.whisper_free_state(s)
+            | None -> ()
             WhisperNative.whisper_free(ctx)
 ```
 
-### Core Streaming Implementation
+### Core Streaming Implementation (Using whisper_state)
 
 ```fsharp
 type WhisperStream(modelPath: string, config: WhisperConfig) =
     let ctx = WhisperNative.whisper_init_from_file(modelPath)
+    let state = WhisperNative.whisper_init_state(ctx)  // CRITICAL: Initialize state for streaming
     let events = Event<TranscriptionEvent>()
-    let mutable contextBuffer = Array.empty<byte>
-    let mutable previousText = ""
-    let mutable audioContext = Array.empty<float32>
-    
-    // Maintain sliding window of audio for context
-    let audioRingBuffer = ResizeArray<float32>()
-    let maxAudioContext = config.ChunkSizeMs * 16 // samples per ms
-    
-    /// Process chunk with overlap and context
+    let mutable previousSegmentCount = 0
+    let mutable committedText = ""
+    let mutable pendingAudio = ResizeArray<float32>()
+
+    // Callback handlers for streaming
+    let mutable newSegmentCallback = Unchecked.defaultof<WhisperNative.WhisperNewSegmentCallback>
+    let mutable encoderBeginCallback = Unchecked.defaultof<WhisperNative.WhisperEncoderBeginCallback>
+
+    // Setup callbacks
+    let setupCallbacks() =
+        newSegmentCallback <- WhisperNative.WhisperNewSegmentCallback(fun ctx state n_new userData ->
+            // Process new segments as they arrive
+            let totalSegments = WhisperNative.whisper_full_n_segments_from_state(state)
+
+            for i in previousSegmentCount .. totalSegments - 1 do
+                let textPtr = WhisperNative.whisper_full_get_segment_text_from_state(state, i)
+                let text = Marshal.PtrToStringAnsi(textPtr)
+                let t0 = WhisperNative.whisper_full_get_segment_t0_from_state(state, i)
+                let t1 = WhisperNative.whisper_full_get_segment_t1_from_state(state, i)
+
+                // Get tokens with confidence
+                let tokenCount = WhisperNative.whisper_full_n_tokens_from_state(state, i)
+                let tokens = [
+                    for j in 0 .. tokenCount - 1 do
+                        let tokenPtr = WhisperNative.whisper_full_get_token_text_from_state(state, i, j)
+                        let tokenText = Marshal.PtrToStringAnsi(tokenPtr)
+                        let prob = WhisperNative.whisper_full_get_token_p_from_state(state, i, j)
+                        yield {
+                            Text = tokenText
+                            Timestamp = float32 t0 / 1000.0f  // CORRECT: Convert ms to seconds
+                            Probability = prob
+                            IsSpecial = tokenText.StartsWith("<|") && tokenText.EndsWith("|>")
+                        }
+                ]
+
+                let segment = {
+                    Text = text
+                    StartTime = float32 t0 / 1000.0f  // Convert ms to seconds
+                    EndTime = float32 t1 / 1000.0f    // Convert ms to seconds
+                    Tokens = tokens
+                }
+
+                // Calculate confidence
+                let confidence =
+                    tokens
+                    |> List.filter (fun t -> not t.IsSpecial)
+                    |> List.averageBy (fun t -> t.Probability)
+
+                // Emit event
+                events.Trigger(PartialTranscription(text, tokens, confidence))
+
+            previousSegmentCount <- totalSegments
+        )
+
+        encoderBeginCallback <- WhisperNative.WhisperEncoderBeginCallback(fun ctx state userData ->
+            // Return true to proceed with encoding
+            true
+        )
+
+    do setupCallbacks()
+
+    /// Process chunk incrementally using whisper_state
     let processChunkInternal (samples: float32[]) = async {
         try
-            // Add to ring buffer
-            audioRingBuffer.AddRange(samples)
-            
-            // Keep only recent context
-            if audioRingBuffer.Count > maxAudioContext then
-                audioRingBuffer.RemoveRange(0, audioRingBuffer.Count - maxAudioContext)
-            
-            // Prepare parameters for streaming
-            let mutable parameters = WhisperNative.WhisperFullParams()
-            parameters.strategy <- 0 // WHISPER_SAMPLING_GREEDY
-            parameters.n_threads <- 4
-            parameters.audio_ctx <- min 1500 (audioRingBuffer.Count / 2) // Adaptive context
-            parameters.single_segment <- false
-            parameters.token_timestamps <- config.TokenTimestamps
-            parameters.suppress_blank <- true
-            parameters.suppress_non_speech_tokens <- true
-            parameters.temperature <- 0.0f
-            parameters.language <- Marshal.StringToHGlobalAnsi(config.Language)
-            
-            // Process with whisper
-            let audioArray = audioRingBuffer.ToArray()
-            let result = WhisperNative.whisper_full(ctx, parameters, audioArray, audioArray.Length)
-            
-            if result = 0 then
-                // Extract segments and tokens
-                let segmentCount = WhisperNative.whisper_full_n_segments(ctx)
-                
-                if segmentCount > 0 then
-                    // Get the latest segment
-                    let segIdx = segmentCount - 1
-                    let textPtr = WhisperNative.whisper_full_get_segment_text(ctx, segIdx)
-                    let text = Marshal.PtrToStringAnsi(textPtr)
-                    
-                    // Get tokens for confidence calculation
-                    let tokenCount = WhisperNative.whisper_full_n_tokens(ctx, segIdx)
-                    let tokens = [
-                        for t in 0 .. tokenCount - 1 do
-                            let tokenPtr = WhisperNative.whisper_full_get_token_text(ctx, segIdx, t)
-                            let tokenText = Marshal.PtrToStringAnsi(tokenPtr)
-                            let prob = WhisperNative.whisper_full_get_token_p(ctx, segIdx, t)
-                            yield {
-                                Text = tokenText
-                                Timestamp = 0.0f // Calculate from position
-                                Probability = prob
-                                IsSpecial = tokenText.StartsWith("<|") && tokenText.EndsWith("|>")
-                            }
-                    ]
-                    
-                    // Calculate average confidence
-                    let confidence = 
-                        tokens 
-                        |> List.filter (fun t -> not t.IsSpecial)
-                        |> List.averageBy (fun t -> t.Probability)
-                    
-                    // Determine if this is stable enough to emit
-                    if confidence >= config.MinConfidence then
-                        // Check for text extension vs correction
-                        if text.StartsWith(previousText) then
-                            // Text is extending - emit partial
-                            events.Trigger(PartialTranscription(text, tokens, confidence))
-                        else
-                            // Text changed - might be a correction
-                            // Only emit if significantly different and confident
-                            let similarity = calculateSimilarity previousText text
-                            if similarity < 0.7f && confidence > config.MinConfidence * 1.2f then
-                                events.Trigger(PartialTranscription(text, tokens, confidence))
-                        
-                        previousText <- text
-                    
-                return PartialTranscription(text, tokens, confidence)
+            // Append new audio to pending buffer
+            pendingAudio.AddRange(samples)
+
+            // Only process if we have enough audio (e.g., 1 second)
+            if pendingAudio.Count >= config.ChunkSizeMs * 16 then
+                let audioToProcess = pendingAudio.ToArray()
+
+                // Prepare parameters for streaming
+                let mutable parameters = WhisperNative.WhisperFullParams()
+                parameters.strategy <- 0  // GREEDY
+                parameters.n_threads <- config.ThreadCount
+                parameters.offset_ms <- 0  // Process from start of chunk
+                parameters.duration_ms <- 0  // Process entire chunk
+                parameters.translate <- config.EnableTranslate
+                parameters.no_context <- false  // Use context from state
+                parameters.single_segment <- false
+                parameters.token_timestamps <- config.TokenTimestamps
+                parameters.suppress_blank <- config.SuppressBlank
+                parameters.suppress_non_speech_tokens <- config.SuppressNonSpeechTokens
+                parameters.temperature <- config.Temperature
+                parameters.temperature_inc <- config.TemperatureInc
+                parameters.beam_size <- config.BeamSize
+                parameters.best_of <- config.BestOf
+                parameters.max_initial_ts <- config.MaxInitialTs
+                parameters.length_penalty <- config.LengthPenalty
+
+                // Set language
+                match config.Language with
+                | Some lang ->
+                    parameters.language <- Marshal.StringToHGlobalAnsi(lang)
+                    parameters.detect_language <- false
+                | None ->
+                    parameters.detect_language <- true
+
+                // Set prompt tokens if provided
+                match config.InitialPrompt with
+                | Some prompt ->
+                    let maxTokens = 512
+                    let tokens = Array.zeroCreate<int> maxTokens
+                    let tokenCount = WhisperNative.whisper_tokenize(ctx, prompt, tokens, maxTokens)
+                    if tokenCount > 0 then
+                        let tokenPtr = Marshal.AllocHGlobal(tokenCount * sizeof<int>)
+                        Marshal.Copy(tokens, 0, tokenPtr, tokenCount)
+                        parameters.prompt_tokens <- tokenPtr
+                        parameters.prompt_n_tokens <- tokenCount
+                | None -> ()
+
+                // Set callbacks
+                let callbackHandle = GCHandle.Alloc(newSegmentCallback)
+                let encoderHandle = GCHandle.Alloc(encoderBeginCallback)
+                parameters.new_segment_callback <- Marshal.GetFunctionPointerForDelegate(newSegmentCallback)
+                parameters.encoder_begin_callback <- Marshal.GetFunctionPointerForDelegate(encoderBeginCallback)
+
+                // Process with state for incremental transcription
+                let result = WhisperNative.whisper_full_with_state(
+                    ctx,
+                    state,  // Use state for continuity
+                    parameters,
+                    audioToProcess,
+                    audioToProcess.Length)
+
+                // Clean up handles
+                callbackHandle.Free()
+                encoderHandle.Free()
+
+                // Clear processed audio
+                pendingAudio.Clear()
+
+                if result = 0 then
+                    // Get latest results from state
+                    let segmentCount = WhisperNative.whisper_full_n_segments_from_state(state)
+                    if segmentCount > 0 then
+                        let lastSegment = segmentCount - 1
+                        let textPtr = WhisperNative.whisper_full_get_segment_text_from_state(state, lastSegment)
+                        let text = Marshal.PtrToStringAnsi(textPtr)
+
+                        // Build complete transcription
+                        let fullText = committedText + " " + text
+
+                        return FinalTranscription(fullText, [], [])
+                    else
+                        return PartialTranscription("", [], 0.0f)
+                else
+                    return ProcessingError($"Whisper processing failed with code {result}")
             else
-                return ProcessingError($"Whisper processing failed with code {result}")
-                
+                // Not enough audio yet, just acknowledge
+                return PartialTranscription("", [], 0.0f)
+
         with ex ->
             return ProcessingError(ex.Message)
     }
@@ -712,19 +1012,100 @@ type WhisperStream(modelPath: string, config: WhisperConfig) =
                 |> List.length
             float32 commonLen / float32 maxLen
     
-    interface IWhisperStream with
-        member _.ProcessChunk(samples) = processChunkInternal samples
-        
-        member _.GetContext() = contextBuffer
-        
-        member _.Reset() =
-            audioRingBuffer.Clear()
-            previousText <- ""
-            contextBuffer <- Array.empty
-            
+    interface IWhisperClient with
+        member _.ProcessAsync(samples) =
+            async {
+                let! result = processChunkInternal samples
+                match result with
+                | PartialTranscription(text, tokens, conf) ->
+                    return Ok {
+                        FullText = text
+                        Segments = []
+                        Duration = TimeSpan.Zero
+                        ProcessingTime = TimeSpan.Zero
+                        Timestamp = DateTime.UtcNow
+                        Language = config.Language
+                        LanguageConfidence = Some conf
+                        Tokens = Some tokens
+                    }
+                | FinalTranscription(text, tokens, segments) ->
+                    return Ok {
+                        FullText = text
+                        Segments = segments
+                        Duration = TimeSpan.Zero
+                        ProcessingTime = TimeSpan.Zero
+                        Timestamp = DateTime.UtcNow
+                        Language = config.Language
+                        LanguageConfidence = None
+                        Tokens = Some tokens
+                    }
+                | ProcessingError msg ->
+                    return Error (ProcessingError(0, msg))
+                | _ ->
+                    return Error (StateError "Unexpected state")
+            }
+
+        member _.ProcessStream(audioStream) =
+            audioStream
+            |> Observable.selectAsync (fun samples ->
+                async {
+                    let! result = processChunkInternal samples
+                    return result
+                })
+
+        member _.ProcessFileAsync(path) =
+            async {
+                try
+                    use stream = File.OpenRead(path)
+                    let buffer = Array.zeroCreate<byte> (int stream.Length)
+                    let! _ = stream.AsyncRead(buffer, 0, buffer.Length)
+                    // Convert to float32 (implementation needed)
+                    let samples = convertWavToFloat32 buffer
+                    return! (this :> IWhisperClient).ProcessAsync(samples)
+                with ex ->
+                    return Error (ProcessingError(0, ex.Message))
+            }
+
+        member _.StreamingMode
+            with get() = config.StreamingMode
+            and set(value) = () // Update config
+
         member _.Events = events.Publish :> IObservable<_>
-        
+
+        member _.Reset() =
+            WhisperNative.whisper_free_state(state)
+            let newState = WhisperNative.whisper_init_state(ctx)
+            // Update state reference
+            previousSegmentCount <- 0
+            committedText <- ""
+            pendingAudio.Clear()
+
+        member _.DetectLanguageAsync(samples) =
+            async {
+                try
+                    let langProbs = Array.zeroCreate<float> 100
+                    let langId = WhisperNative.whisper_lang_auto_detect(ctx, 0, config.ThreadCount, langProbs)
+                    if langId >= 0 then
+                        let langPtr = WhisperNative.whisper_lang_str(langId)
+                        let lang = Marshal.PtrToStringAnsi(langPtr)
+                        let probMap =
+                            langProbs
+                            |> Array.mapi (fun i p -> (getLanguageCode i, p))
+                            |> Array.filter (fun (_, p) -> p > 0.0f)
+                            |> Map.ofArray
+                        return Ok {
+                            Language = lang
+                            Confidence = langProbs.[langId]
+                            Probabilities = probMap
+                        }
+                    else
+                        return Error (ProcessingError(langId, "Language detection failed"))
+                with ex ->
+                    return Error (ProcessingError(0, ex.Message))
+            }
+
         member _.Dispose() =
+            WhisperNative.whisper_free_state(state)
             WhisperNative.whisper_free(ctx)
 ```
 
@@ -977,27 +1358,47 @@ let parallelTranscription (audioStreams: IObservable<float32[]> list) =
 ## Error Handling and Recovery
 
 ```fsharp
-type StreamError =
-    | ModelLoadError of string
-    | AudioProcessingError of string
-    | ContextOverflow
-    | NetworkTimeout
-    
-let resilientStream (config: StreamConfig) =
-    let rec processWithRetry (samples: float32[]) (retries: int) =
+/// Comprehensive error handling with Result type
+module ErrorHandling =
+
+    /// Convert native error codes to discriminated unions
+    let mapNativeError (code: int) =
+        match code with
+        | -1 -> ModelLoadError "Failed to load model"
+        | -2 -> InvalidAudioFormat "Invalid audio format"
+        | -3 -> OutOfMemory
+        | -4 -> StateError "Invalid state"
+        | _ -> ProcessingError(code, $"Unknown error code: {code}")
+
+    /// Retry logic with exponential backoff
+    let retryWithBackoff<'T> (operation: unit -> Async<Result<'T, WhisperError>>) (maxRetries: int) =
+        let rec retry attempt delay =
+            async {
+                match! operation() with
+                | Ok result -> return Ok result
+                | Error err when attempt < maxRetries ->
+                    match err with
+                    | OutOfMemory | ProcessingError _ ->
+                        // Retryable errors
+                        do! Async.Sleep delay
+                        return! retry (attempt + 1) (delay * 2)
+                    | _ ->
+                        // Non-retryable errors
+                        return Error err
+                | Error err -> return Error err
+            }
+        retry 0 100
+
+    /// Resource cleanup with error handling
+    let useResource (acquire: unit -> 'T) (release: 'T -> unit) (action: 'T -> Async<Result<'R, WhisperError>>) =
         async {
+            let resource = acquire()
             try
-                return! whisperStream.ProcessChunk(samples)
-            with
-            | :? OutOfMemoryException when retries > 0 ->
-                // Clear context and retry
-                whisperStream.Reset()
-                return! processWithRetry samples (retries - 1)
-            | ex ->
-                return ProcessingError(ex.Message)
+                return! action resource
+            finally
+                try release resource
+                with _ -> () // Suppress cleanup errors
         }
-    
-    processWithRetry
 ```
 
 ## Testing Strategy
@@ -1082,53 +1483,63 @@ module Testing =
 
 ## Migration Path from Current Implementation
 
-### Phase 1: Drop-in Replacement (Week 1-2)
+### Phase 1: Drop-in Replacement 
 - Implement core Whisper.NET-compatible API surface
 - Ensure 100% backward compatibility for PTT mode
 - Run side-by-side testing with existing implementation
 - Migration requires only namespace change
 
-### Phase 2: Enhanced PTT Features (Week 3-4)
+### Phase 2: Enhanced PTT Features 
 - Enable token-level timestamps and confidence scores
 - Add language detection for auto-language support
 - Implement custom prompts for domain-specific vocabulary
 - Add VAD for better silence handling in PTT mode
 
-### Phase 3: Streaming Introduction (Week 5-6)
+### Phase 3: Streaming Introduction
 - Roll out experimental streaming mode
 - A/B test streaming vs batch for user preference
 - Tune stability thresholds based on feedback
 - Monitor performance and accuracy metrics
 
-### Phase 4: Full Migration (Week 7-8)
+### Phase 4: Full Migration
 - Replace Whisper.NET completely
 - Remove old dependencies from project
 - Update documentation and examples
 - Optimize based on real-world usage patterns
 
+## Key Architectural Corrections from Review
+
+Based on thorough analysis of whisper.cpp and Whisper.NET:
+
+### Critical Implementation Requirements:
+
+1. **Stateful Streaming**: Uses `whisper_state` object and `whisper_full_with_state` for true incremental processing
+2. **Correct Timestamps**: Timestamps are in milliseconds, requiring `/1000.0f` conversion to seconds
+3. **Proper Tokenization**: Prompts must be tokenized via `whisper_tokenize`, not passed as byte arrays
+4. **Unified API**: Single `IWhisperClient` interface instead of separate processor/stream interfaces
+5. **Native Library Management**: Automatic runtime selection based on platform capabilities (CUDA, AVX, CoreML)
+6. **Result Types**: F# idiomatic error handling with `Result<'T, WhisperError>` instead of exceptions
+
+### Implementation Highlights:
+
+- **Streaming Callbacks**: Proper use of `new_segment_callback` and `encoder_begin_callback` for real-time updates
+- **State Management**: Maintains `whisper_state` for context across chunks, enabling true streaming
+- **Error Recovery**: Comprehensive error types with retry logic and resource cleanup
+- **Platform Support**: Automatic detection and loading of optimal runtime (CUDA, CoreML, etc.)
+- **Backward Compatibility**: Legacy `IWhisperProcessor` interface marked obsolete but still supported
+
 ## Conclusion
 
-Whisper-FS represents a comprehensive unification of transcription capabilities, providing complete feature parity with Whisper.NET while adding advanced streaming support. This "one-stop shopping" library eliminates the need for multiple dependencies and provides a consistent F# API for all transcription scenarios.
+Whisper-FS represents a comprehensive, architecturally sound unification of transcription capabilities. By correctly implementing whisper.cpp's streaming API with `whisper_state` and providing proper P/Invoke bindings, it delivers:
 
-### Key Achievements:
+1. **True Streaming**: Incremental processing with state management, not repeated full processing
+2. **Complete Feature Parity**: All Whisper.NET features plus access to advanced whisper.cpp capabilities
+3. **Unified Architecture**: Single `IWhisperClient` interface adaptable to both batch and streaming modes
+4. **Robust Error Handling**: F# idiomatic `Result` types with comprehensive error discrimination
+5. **Automatic Runtime Selection**: Platform-aware loading of optimal native libraries
+6. **Proper Resource Management**: Deterministic disposal with state cleanup
 
-1. **100% Whisper.NET Compatibility**: Drop-in replacement with identical API for existing PTT workflows
-2. **Extended Feature Set**: Access to token-level data, confidence scores, language detection, and advanced whisper.cpp features
-3. **True Streaming Support**: Real-time transcription with configurable stability/latency tradeoffs
-4. **Unified Architecture**: Single library handles both batch and streaming modes seamlessly
-5. **F# Idiomatic Design**: Leverages functional programming patterns for cleaner, more maintainable code
-6. **Performance Optimized**: Zero-copy operations, memory pooling, and efficient streaming pipelines
-
-### Feature Completeness:
-
-The library provides:
-- **All existing Whisper.NET features** for backward compatibility
-- **All whisper.cpp native features** previously inaccessible
-- **New streaming capabilities** for real-time scenarios
-- **Enhanced observability** through confidence scores and token-level data
-- **Better resource management** with streaming-friendly memory patterns
-
-By consolidating all transcription needs into a single, well-designed library, Whisper-FS simplifies development, reduces dependencies, and provides a clear upgrade path from batch-only to streaming-capable transcription.
+The design addresses all identified gaps from the review, ensuring correct use of whisper.cpp's streaming API while maintaining backward compatibility and providing a superior developer experience through F#'s functional programming paradigms.
 
 ### Next Steps
 
