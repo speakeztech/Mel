@@ -491,3 +491,4 @@ models/
 
 # Transcripts
 transcripts/
+.claude/settings.local.json
