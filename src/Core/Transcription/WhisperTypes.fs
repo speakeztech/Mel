@@ -1,12 +1,12 @@
 namespace Mel.Core.Transcription
 
 open System
-open Whisper.net.Ggml
+open WhisperFS
 
 type WhisperConfig = {
     ModelPath: string
-    ModelType: GgmlType
-    Language: string
+    ModelType: ModelType
+    Language: string option
     UseGpu: bool
     ThreadCount: int
     MaxSegmentLength: int
@@ -17,7 +17,7 @@ type TranscriptionSegment = {
     Start: float
     End: float
     Text: string
-    Confidence: float option
+    Confidence: float32 option
 }
 
 type TranscriptionResult = {
@@ -42,14 +42,14 @@ type IWhisperTranscriber =
     inherit IDisposable
 
 type ModelDownloadInfo = {
-    ModelType: GgmlType
+    ModelType: ModelType
     Size: int64
     Url: string option
     IsQuantized: bool
 }
 
 type ModelDownloadProgress = {
-    ModelType: GgmlType
+    ModelType: ModelType
     BytesDownloaded: int64
     TotalBytes: int64
     PercentComplete: float

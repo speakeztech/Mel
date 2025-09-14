@@ -6,11 +6,15 @@ open Avalonia.Controls
 open Avalonia.Layout
 open Avalonia.Media
 open Avalonia.Threading
-open Whisper.net.Ggml
+// Only import specific WhisperFS types
+
+type TranscriptionMode =
+    | PTT  // Push-to-talk (batch)
+    | ASR  // Automatic speech recognition (streaming)
 
 type SettingsWindow() as this =
     inherit Window()
-    
+
     let mutable levelProgressBar: ProgressBar option = None
     let mutable levelLabel: TextBlock option = None
     let mutable logTextBox: TextBox option = None
@@ -19,6 +23,8 @@ type SettingsWindow() as this =
     let mutable statusLabel: TextBlock option = None
     let mutable transcriptionLabel: TextBlock option = None
     let mutable speechIndicator: Border option = None
+    let mutable asrRadio: RadioButton option = None
+    let mutable pttRadio: RadioButton option = None
     
     do
         this.Title <- "SpeakEZ Settings"
@@ -149,6 +155,38 @@ type SettingsWindow() as this =
         
         modelSection.Child <- modelPanel
         mainPanel.Children.Add(modelSection)
+
+        // Transcription Mode section
+        let modeSection = Border()
+        modeSection.Background <- SolidColorBrush(Color.FromRgb(40uy, 40uy, 40uy))
+        modeSection.CornerRadius <- CornerRadius(5.0)
+        modeSection.Padding <- Thickness(10.0)
+
+        let modePanel = StackPanel()
+        modePanel.Spacing <- 10.0
+
+        let modeTitle = TextBlock()
+        modeTitle.Text <- "Transcription Mode"
+        modeTitle.FontWeight <- FontWeight.SemiBold
+        modePanel.Children.Add(modeTitle)
+
+        // Mode selection radio buttons
+        let asrRadioButton = RadioButton()
+        asrRadioButton.Content <- "ASR (Streaming) - Real-time transcription as you speak"
+        asrRadioButton.IsChecked <- Nullable<bool>(true) // Default to ASR
+        asrRadioButton.GroupName <- "TranscriptionMode"
+        modePanel.Children.Add(asrRadioButton)
+        asrRadio <- Some asrRadioButton
+
+        let pttRadioButton = RadioButton()
+        pttRadioButton.Content <- "PTT (Batch) - Transcribe after releasing F9"
+        pttRadioButton.IsChecked <- Nullable<bool>(false)
+        pttRadioButton.GroupName <- "TranscriptionMode"
+        modePanel.Children.Add(pttRadioButton)
+        pttRadio <- Some pttRadioButton
+
+        modeSection.Child <- modePanel
+        mainPanel.Children.Add(modeSection)
         
         // Status section
         let statusSection = Border()
@@ -329,14 +367,14 @@ type SettingsWindow() as this =
     
     member this.GetSelectedModel() =
         match modelCombo with
-        | Some combo -> 
+        | Some combo ->
             match combo.SelectedIndex with
-            | 0 -> GgmlType.Tiny
-            | 1 -> GgmlType.Base
-            | 2 -> GgmlType.Small
-            | 3 -> GgmlType.Medium
-            | _ -> GgmlType.Base
-        | None -> GgmlType.Base
+            | 0 -> WhisperFS.ModelType.Tiny
+            | 1 -> WhisperFS.ModelType.Base
+            | 2 -> WhisperFS.ModelType.Small
+            | 3 -> WhisperFS.ModelType.Medium
+            | _ -> WhisperFS.ModelType.Base
+        | None -> WhisperFS.ModelType.Base
     
     member this.SetSpeechDetected(detected: bool) =
         match speechIndicator with
@@ -368,3 +406,8 @@ type SettingsWindow() as this =
                 label.FontStyle <- FontStyle.Normal
             )
         | None -> ()
+
+    member this.GetTranscriptionMode() =
+        match asrRadio with
+        | Some radio when radio.IsChecked.HasValue && radio.IsChecked.Value -> ASR
+        | _ -> PTT

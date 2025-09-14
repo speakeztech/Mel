@@ -15,7 +15,8 @@ open Mel.Core.Audio.Capture
 open Mel.Core.Transcription
 open Mel.Core.Transcription.Whisper
 open Mel.Core.Service
-open Whisper.net.Ggml
+// Only import specific WhisperFS types we need
+// to avoid conflicts with existing Mel types
 
 // Windows API for sending keystrokes and hotkeys
 module WinApi =
@@ -83,7 +84,7 @@ module WinApi =
 
 type SpeakEZApp() =
     inherit Application()
-    
+
     let mutable trayIcon: TrayIcon option = None
     let mutable isRecording = false
     let mutable audioCapture: IAudioCapture option = None
@@ -95,10 +96,15 @@ type SpeakEZApp() =
     let mutable statusMenuItem: NativeMenuItem option = None
     let mutable levelMenuItem: NativeMenuItem option = None
     let mutable deviceMenuItem: NativeMenuItem option = None
-    
-    // Simple push-to-talk state
-    // audioBuffer already defined above for VAD processing
-    
+
+    // Transcription mode state
+    let mutable transcriptionMode = Mel.UI.SettingsWindow.TranscriptionMode.ASR // Default to ASR
+    let mutable streamingClient: WhisperFS.IWhisperClient option = None
+    let mutable streamingBuffer = ResizeArray<float32>()
+    let mutable lastTranscribedText = ""
+    let mutable isProcessingAudio = false  // Flag to control whether we process captured audio
+    let mutable captureThread: Thread option = None  // Keep capture thread reference
+
     let mutable logHistory = ResizeArray<string>()
     let logEvent = Event<string>()
     let debugMode = Environment.GetEnvironmentVariable("SPEAKEZ_DEBUG") = "1"
@@ -141,15 +147,70 @@ type SpeakEZApp() =
             log $"Typed text: {text}"
         with
         | ex -> log $"Error typing text: {ex.Message}"
-    
+
     let calculateRMS (samples: float32[]) =
-        if samples = null || samples.Length = 0 then 
+        if samples = null || samples.Length = 0 then
             -60.0f // Return very low dB for empty/null samples
         else
             let sum = samples |> Array.sumBy (fun s -> s * s)
             let rms = sqrt(sum / float32 samples.Length)
             if rms = 0.0f || System.Single.IsNaN(rms) then -60.0f
             else rms
+
+    let processStreamingTranscription() =
+        // Process audio in streaming mode with sliding windows
+        async {
+            try
+                // For streaming, use the existing transcriber
+                match whisperTranscriber with
+                | Some transcriber ->
+                    // Process buffered audio in larger chunks for better context
+                    let chunkSize = 32000 // 2 seconds at 16kHz for better context
+                    if streamingBuffer.Count >= chunkSize then
+                        let chunk = streamingBuffer.GetRange(0, chunkSize).ToArray()
+
+                        // Check if chunk has sufficient energy (not silence)
+                        let rms = calculateRMS chunk
+                        let dbLevel = if rms <= -60.0f then rms else 20.0f * log10(max 0.0001f rms)
+
+                        // Only process if audio is above silence threshold (more permissive)
+                        if dbLevel > -45.0f then // Lower threshold to catch softer speech
+                            streamingBuffer.RemoveRange(0, chunkSize)
+
+                            // Transcribe chunk
+                            let! result = transcriber.TranscribeAsync(chunk, 16000)
+                            let newText = result.FullText.Trim()
+
+                            // Filter out common Whisper hallucinations
+                            let hallucinations = [
+                                "thank you"; "thanks"; "thank you."; "thanks.";
+                                "you"; "thank you for watching"; "bye"; "goodbye";
+                                "please subscribe"; "see you"; "music";
+                                "[music]"; "[applause]"; "foreign"
+                            ]
+
+                            let isHallucination =
+                                hallucinations
+                                |> List.exists (fun h -> newText.ToLowerInvariant().Trim() = h)
+
+                            // Only type if we have meaningful text and it's not a hallucination
+                            if newText.Length > 0 && not isHallucination then
+                                Avalonia.Threading.Dispatcher.UIThread.Post(fun () ->
+                                    typeText (newText + " ")
+                                )
+
+                                // Update settings window
+                                match settingsWindow with
+                                | Some window -> window.SetTranscription(newText)
+                                | None -> ()
+                        else
+                            // Remove silent chunk to prevent buffer overflow
+                            streamingBuffer.RemoveRange(0, min chunkSize streamingBuffer.Count)
+                | None ->
+                    log "No transcriber available for streaming"
+            with ex ->
+                log $"Streaming processing error: {ex.Message}"
+        }
     
     // Removed parallel transcription - using simple push-to-talk instead
     
@@ -159,14 +220,14 @@ type SpeakEZApp() =
             log "Warning: Received null audio samples"
         elif frame.Samples.Length = 0 then
             log "Warning: Received empty audio frame"
-        
+
         let rms = calculateRMS frame.Samples
-        let dbLevel = 
+        let dbLevel =
             if rms <= -60.0f then rms
             else 20.0f * log10(max 0.0001f rms)
-        
+
         // Update level display
-        let bars = 
+        let bars =
             if System.Single.IsNaN(dbLevel) || System.Single.IsInfinity(dbLevel) then
                 "❌ERROR❌"
             elif dbLevel > -10.0f then "████████"
@@ -174,93 +235,160 @@ type SpeakEZApp() =
             elif dbLevel > -30.0f then "████░░░░"
             elif dbLevel > -40.0f then "██░░░░░░"
             else "░░░░░░░░"
-        
+
         match levelMenuItem with
-        | Some item -> 
+        | Some item ->
             item.Header <- $"Level: {bars} ({dbLevel:F1} dB)"
         | None -> ()
-        
+
         // Update settings window if open
         match settingsWindow with
         | Some window -> window.UpdateLevel(dbLevel)
         | None -> ()
-        
-        // Recording state is handled by VAD processing below
-        
-        // Process with VAD
-        match vad with
-        | Some vadProcessor ->
-            let result = vadProcessor.ProcessFrame(frame)
-            match result with
-            | SpeechStarted ->
-                log "🎤 Speech detected"
-                // Don't clear buffer - we want to keep any audio that led to speech detection
-                // audioBuffer.Clear()  // REMOVED - this was dropping initial audio
-                audioBuffer.AddRange(frame.Samples)
-                // Update settings window
+
+        // Only process audio for transcription if F9 is held (isProcessingAudio = true)
+        if isProcessingAudio then
+            // Check transcription mode
+            let mode =
                 match settingsWindow with
-                | Some window -> window.SetSpeechDetected(true)
+                | Some window -> window.GetTranscriptionMode()
+                | None -> transcriptionMode
+
+            // Handle audio based on mode
+            if mode = Mel.UI.SettingsWindow.TranscriptionMode.ASR then
+                // ASR streaming mode - add to streaming buffer and process
+                streamingBuffer.AddRange(frame.Samples)
+
+                // Process streaming chunks periodically with larger chunks
+                if streamingBuffer.Count >= 32000 then // 2 seconds of audio for better context
+                    processStreamingTranscription() |> Async.Start
+
+                // Prevent buffer from growing too large (keep max 10 seconds)
+                if streamingBuffer.Count > 160000 then // 10 seconds at 16kHz
+                    let excess = streamingBuffer.Count - 160000
+                    streamingBuffer.RemoveRange(0, excess)
+                    log "Trimmed excess streaming buffer"
+            else
+                // PTT batch mode - use VAD processing
+                // Process with VAD
+                match vad with
+                | Some vadProcessor ->
+                    let result = vadProcessor.ProcessFrame(frame)
+                    match result with
+                    | SpeechStarted ->
+                        log "🎤 Speech detected"
+                        // Don't clear buffer - we want to keep any audio that led to speech detection
+                        // audioBuffer.Clear()  // REMOVED - this was dropping initial audio
+                        audioBuffer.AddRange(frame.Samples)
+                        // Update settings window
+                        match settingsWindow with
+                        | Some window -> window.SetSpeechDetected(true)
+                        | None -> ()
+
+                    | SpeechContinuing ->
+                        audioBuffer.AddRange(frame.Samples)
+                        // Silent during continuous speech
+
+                    | NoChange ->
+                        // Keep a rolling buffer even when no speech detected
+                        // This ensures we capture the beginning of speech
+                        audioBuffer.AddRange(frame.Samples)
+                        // Keep only last 1 second of audio (16000 samples)
+                        if audioBuffer.Count > 16000 then
+                            let excess = audioBuffer.Count - 16000
+                            audioBuffer.RemoveRange(0, excess)
+
+                    | SpeechEnded duration ->
+                        log $"🔇 Speech ended after {duration.TotalSeconds:F1}s - transcribing..."
+
+                        // Update settings window
+                        match settingsWindow with
+                        | Some window -> window.SetSpeechDetected(false)
+                        | None -> ()
+
+                        if audioBuffer.Count > 8000 then // At least 0.5 seconds
+                            let samples = audioBuffer.ToArray()
+                            audioBuffer.Clear()
+
+                            // Transcribe asynchronously
+                            async {
+                                try
+                                    match whisperTranscriber with
+                                    | Some transcriber ->
+                                        log $"Sending {samples.Length} samples to Whisper..."
+                                        let! result = transcriber.TranscribeAsync(samples, 16000)
+                                        if not (String.IsNullOrWhiteSpace(result.FullText)) then
+                                            log $"✅ Transcribed: '{result.FullText}'"
+
+                                            // Update settings window
+                                            match settingsWindow with
+                                            | Some window -> window.SetTranscription(result.FullText)
+                                            | None -> ()
+
+                                            // Type the text at cursor on UI thread with trailing space
+                                            Avalonia.Threading.Dispatcher.UIThread.Post(fun () ->
+                                                typeText (result.FullText + " ")
+                                            )
+                                        else
+                                            ()  // Silent on empty result
+                                    | None ->
+                                        log "❌ Transcriber not initialized"
+                                with
+                                | ex ->
+                                    log $"❌ Transcription error: {ex.Message}"
+                                    if ex.InnerException <> null then
+                                        log $"Inner exception: {ex.InnerException.Message}"
+                            } |> Async.Start
                 | None -> ()
-                
-            | SpeechContinuing ->
-                audioBuffer.AddRange(frame.Samples)
-                // Silent during continuous speech
-                
-            | NoChange ->
-                // Keep a rolling buffer even when no speech detected
-                // This ensures we capture the beginning of speech
-                audioBuffer.AddRange(frame.Samples)
-                // Keep only last 1 second of audio (16000 samples)
-                if audioBuffer.Count > 16000 then
-                    let excess = audioBuffer.Count - 16000
-                    audioBuffer.RemoveRange(0, excess)
-                
-            | SpeechEnded duration ->
-                log $"🔇 Speech ended after {duration.TotalSeconds:F1}s - transcribing..."
-                
-                // Update settings window
-                match settingsWindow with
-                | Some window -> window.SetSpeechDetected(false)
-                | None -> ()
-                
-                if audioBuffer.Count > 8000 then // At least 0.5 seconds
-                    let samples = audioBuffer.ToArray()
-                    audioBuffer.Clear()
-                    
-                    // Transcribe asynchronously
-                    async {
-                        try
-                            match whisperTranscriber with
-                            | Some transcriber ->
-                                log $"Sending {samples.Length} samples to Whisper..."
-                                let! result = transcriber.TranscribeAsync(samples, 16000)
-                                if not (String.IsNullOrWhiteSpace(result.FullText)) then
-                                    log $"✅ Transcribed: '{result.FullText}'"
-                                    
-                                    // Update settings window
-                                    match settingsWindow with
-                                    | Some window -> window.SetTranscription(result.FullText)
-                                    | None -> ()
-                                    
-                                    // Type the text at cursor on UI thread with trailing space
-                                    Avalonia.Threading.Dispatcher.UIThread.Post(fun () ->
-                                        typeText (result.FullText + " ")
-                                    )
-                                else
-                                    ()  // Silent on empty result
-                            | None -> 
-                                log "❌ Transcriber not initialized"
-                        with
-                        | ex -> 
-                            log $"❌ Transcription error: {ex.Message}"
-                            if ex.InnerException <> null then
-                                log $"Inner exception: {ex.InnerException.Message}"
-                    } |> Async.Start
-        | None -> ()
     
+    let startContinuousCapture() =
+        // Start audio capture that runs continuously in the background
+        if audioCapture.IsNone then
+            try
+                let capture = new WasapiCapture(selectedDeviceIndex, 8192)
+                audioCapture <- Some (capture :> IAudioCapture)
+                log "Initialized continuous audio capture"
+            with ex ->
+                log $"Failed to initialize continuous audio capture: {ex.Message}"
+                ()
+
+        match audioCapture with
+        | Some capture ->
+            try
+                capture.StartCapture()
+                log "Started continuous audio capture"
+
+                // Start processing thread
+                let thread = Thread(fun () ->
+                    let mutable running = true
+
+                    while running do
+                        try
+                            let frameTask = capture.CaptureFrameAsync(CancellationToken.None)
+                            match Async.RunSynchronously (async { return! frameTask }) with
+                            | Some frame ->
+                                // Process on UI thread for menu updates
+                                Avalonia.Threading.Dispatcher.UIThread.Post(fun () ->
+                                    processAudioFrame frame
+                                )
+                            | None ->
+                                Thread.Sleep(10)
+                        with
+                        | ex ->
+                            log $"Audio processing error: {ex.Message}"
+                            Thread.Sleep(100)
+                )
+                thread.IsBackground <- true
+                thread.Start()
+                captureThread <- Some thread
+            with ex ->
+                log $"Failed to start continuous capture: {ex.Message}"
+        | None ->
+            log "No audio capture device available"
+
     let rec updateMenuStatus() =
         match statusMenuItem with
-        | Some item -> 
+        | Some item ->
             if isRecording then
                 item.Header <- "🔴 Recording... (Press F9 to stop)"
             else
@@ -269,136 +397,125 @@ type SpeakEZApp() =
     
     and startRecording() =
         if not isRecording then
-            // Recording started
+            // Recording started - just set flags, audio capture is already running
             isRecording <- true
+            isProcessingAudio <- true  // Enable audio processing
             updateMenuStatus()
-            
-            // Clear audio buffer for new recording
-            audioBuffer.Clear()
-            
-            // Don't clear buffer - we want to keep pre-speech audio
-            
-            // Initialize audio capture if needed (on main thread first)
-            if audioCapture.IsNone then
-                try
-                    // Use selected device with larger buffer for virtual devices
-                    let capture = new WasapiCapture(selectedDeviceIndex, 8192) // Increased buffer size
-                    audioCapture <- Some (capture :> IAudioCapture)
-                with ex ->
-                    log $"Failed to initialize audio capture: {ex.Message}"
-            
-            // Start capture
-            match audioCapture with
-            | Some capture ->
-                try
-                    capture.StartCapture()
-                    
-                    // Start processing thread
-                    let thread = Thread(fun () ->
-                        let mutable running = true
-                        let mutable frameCount = 0
-                        let mutable emptyFrameCount = 0
-                        
-                        while running && isRecording do
-                            try
-                                let frameTask = capture.CaptureFrameAsync(CancellationToken.None)
-                                match Async.RunSynchronously (async { return! frameTask }) with
-                                | Some frame -> 
-                                    frameCount <- frameCount + 1
-                                    
-                                    // Check frame validity
-                                    if frame.Samples = null || frame.Samples.Length = 0 then
-                                        emptyFrameCount <- emptyFrameCount + 1
-                                        if emptyFrameCount % 10 = 0 then
-                                            log $"Received {emptyFrameCount} empty frames"
-                                    else
-                                        if frameCount % 100 = 0 then
-                                            log $"Processed {frameCount} audio frames ({frame.Samples.Length} samples each)"
-                                        
-                                        // Process on UI thread for menu updates
-                                        Avalonia.Threading.Dispatcher.UIThread.Post(fun () ->
-                                            processAudioFrame frame
-                                        )
-                                | None -> 
-                                    Thread.Sleep(10)
-                            with
-                            | ex -> 
-                                log $"Audio processing error: {ex.Message}"
-                                log $"Stack trace: {ex.StackTrace}"
-                                running <- false
-                    )
-                    thread.IsBackground <- true
-                    thread.Start()
-                    recordingThread <- Some thread
-                with ex ->
-                    log $"Failed to start capture: {ex.Message}"
-            | None -> 
-                log "No audio capture device available"
+
+            // Check transcription mode
+            let mode =
+                match settingsWindow with
+                | Some window -> window.GetTranscriptionMode()
+                | None -> transcriptionMode
+
+            if mode = Mel.UI.SettingsWindow.TranscriptionMode.ASR then
+                // ASR mode - clear streaming buffers for new session
+                streamingBuffer.Clear()
+                lastTranscribedText <- ""
+                log $"Starting ASR streaming mode (buffer cleared, size: {streamingBuffer.Count})"
+            else
+                // PTT mode - clear audio buffer for new recording
+                audioBuffer.Clear()
+                log "Starting PTT batch mode"
     
     let stopRecording() =
         if isRecording then
-            // Stopping recording
+            // Stopping recording - just disable processing, keep capture running
             isRecording <- false
+            isProcessingAudio <- false  // Stop processing audio for transcription
             updateMenuStatus()
-            
-            // Transcribe the buffered audio
-            if audioBuffer.Count > 8000 then // At least 0.5 seconds
-                let samples = audioBuffer.ToArray()
-                
-                // Transcribe asynchronously
+
+            // Check transcription mode
+            let mode =
+                match settingsWindow with
+                | Some window -> window.GetTranscriptionMode()
+                | None -> transcriptionMode
+
+            if mode = Mel.UI.SettingsWindow.TranscriptionMode.ASR then
+                // ASR mode - process remaining streaming buffer
+                log $"Stopping ASR streaming, processing remaining buffer ({streamingBuffer.Count} samples)..."
+
+                // Process any remaining audio in the streaming buffer
                 async {
-                    try
+                    // Force process any remaining audio, even if smaller than normal chunk size
+                    if streamingBuffer.Count >= 8000 then // At least 0.5 seconds
+                        // Process whatever is left
+                        let chunk = streamingBuffer.ToArray()
+                        streamingBuffer.Clear()
+
                         match whisperTranscriber with
                         | Some transcriber ->
-                            log $"Transcribing {samples.Length} samples..."
-                            let! result = transcriber.TranscribeAsync(samples, 16000)
-                            if not (String.IsNullOrWhiteSpace(result.FullText)) then
-                                let finalText = result.FullText.Trim()
-                                log $"✅ Transcribed: '{finalText}'"
-                                
-                                // Update settings window
-                                match settingsWindow with
-                                | Some window -> window.SetTranscription(finalText)
-                                | None -> ()
-                                
-                                // Type the text at cursor with trailing space
+                            let! result = transcriber.TranscribeAsync(chunk, 16000)
+                            let newText = result.FullText.Trim()
+
+                            // Filter hallucinations
+                            let hallucinations = [
+                                "thank you"; "thanks"; "thank you."; "thanks.";
+                                "you"; "thank you for watching"; "bye"; "goodbye";
+                                "please subscribe"; "see you"; "music";
+                                "[music]"; "[applause]"; "foreign"
+                            ]
+
+                            let isHallucination =
+                                hallucinations
+                                |> List.exists (fun h -> newText.ToLowerInvariant().Trim() = h)
+
+                            if newText.Length > 0 && not isHallucination then
                                 Avalonia.Threading.Dispatcher.UIThread.Post(fun () ->
-                                    typeText (finalText + " ")
+                                    typeText (newText + " ")
                                 )
-                        | None -> 
-                            log "❌ Transcriber not initialized"
-                    with
-                    | ex -> 
-                        log $"❌ Transcription error: {ex.Message}"
-                        if ex.InnerException <> null then
-                            log $"Inner exception: {ex.InnerException.Message}"
+                        | None -> ()
+                    else
+                        // Too short to process, just clear
+                        streamingBuffer.Clear()
+
+                    log "ASR streaming buffer processed and cleared"
                 } |> Async.Start
-            
+            else
+                // PTT mode - transcribe the buffered audio
+                if audioBuffer.Count > 8000 then // At least 0.5 seconds
+                    let samples = audioBuffer.ToArray()
+
+                    // Transcribe asynchronously
+                    async {
+                        try
+                            match whisperTranscriber with
+                            | Some transcriber ->
+                                log $"Transcribing {samples.Length} samples..."
+                                let! result = transcriber.TranscribeAsync(samples, 16000)
+                                if not (String.IsNullOrWhiteSpace(result.FullText)) then
+                                    let finalText = result.FullText.Trim()
+                                    log $"✅ Transcribed: '{finalText}'"
+
+                                    // Update settings window
+                                    match settingsWindow with
+                                    | Some window -> window.SetTranscription(finalText)
+                                    | None -> ()
+
+                                    // Type the text at cursor with trailing space
+                                    Avalonia.Threading.Dispatcher.UIThread.Post(fun () ->
+                                        typeText (finalText + " ")
+                                    )
+                            | None ->
+                                log "❌ Transcriber not initialized"
+                        with
+                        | ex ->
+                            log $"❌ Transcription error: {ex.Message}"
+                            if ex.InnerException <> null then
+                                log $"Inner exception: {ex.InnerException.Message}"
+                    } |> Async.Start
+
             // Clear speech indicator
             match settingsWindow with
             | Some window -> window.SetSpeechDetected(false)
             | None -> ()
-            
-            // Stop capture
-            match audioCapture with
-            | Some capture -> 
-                capture.StopCapture()
-                (capture :> IDisposable).Dispose()
-                audioCapture <- None  // Clear so it's reinitialized next time
-            | None -> ()
-            
-            // Stop processing thread
-            match recordingThread with
-            | Some thread -> 
-                thread.Join(1000) |> ignore
-                recordingThread <- None
-            | None -> ()
-            
-            // Reset VAD state
+
+            // Reset VAD state for PTT mode
             match vad with
             | Some vadProcessor -> vadProcessor.Reset()
             | None -> ()
-            
+
+            // Clear batch buffer for PTT mode
             audioBuffer.Clear()
     
     let toggleRecording() =
@@ -430,13 +547,13 @@ type SpeakEZApp() =
                     log "Initializing Whisper transcriber..."
                     
                     // Use Base model by default
-                    let modelType = GgmlType.Base
+                    let modelType = WhisperFS.ModelType.Base
                     let modelName = "base"
                     
                     let config = {
                         ModelPath = $"./models/ggml-{modelName}.bin"
                         ModelType = modelType
-                        Language = "en"
+                        Language = Some "en"
                         UseGpu = true
                         ThreadCount = 4
                         MaxSegmentLength = 30
@@ -445,13 +562,19 @@ type SpeakEZApp() =
                     
                     try
                         log $"Using Whisper model: {modelName} at {config.ModelPath}"
-                        
+
                         // Check if model exists
                         if not (System.IO.File.Exists(config.ModelPath)) then
-                            log $"Model file not found, will download on first use"
-                        
+                            log $"Model file not found, will download during initialization"
+
+                        log "Initializing WhisperFS and downloading native libraries..."
                         whisperTranscriber <- Some (new WhisperTranscriber(config) :> IWhisperTranscriber)
-                        log "Whisper initialized successfully"
+
+                        // Give WhisperFS time to download and initialize native libraries
+                        // This happens in the background but we'll give it a moment
+                        do! Async.Sleep(100)
+
+                        log "Whisper transcriber created, native library initialization in progress"
                     with ex ->
                         log $"WARNING: Whisper initialization failed: {ex.Message}"
                         log "Transcription will not be available"
@@ -467,7 +590,10 @@ type SpeakEZApp() =
                     }
                     vad <- Some (new VoiceActivityDetector(vadConfig))
                     log "VAD initialized with improved sensitivity"
-                    
+
+                    // Start continuous audio capture
+                    startContinuousCapture()
+
                 with ex ->
                     log $"Error in deferred initialization: {ex.Message}"
             } |> Async.Start

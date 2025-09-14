@@ -2,177 +2,179 @@ module Mel.Core.Transcription.Whisper
 
 open System
 open System.IO
-open System.Threading.Tasks
-open Whisper.net
-open Whisper.net.Ggml
+open WhisperFS
 open Mel.Core.Transcription
 
+// Global initialization state - shared across all instances
+let mutable private globalInitialized = false
+let private initLock = obj()
+
+let private ensureGlobalInitialized() =
+    async {
+        if not globalInitialized then
+            return lock initLock (fun () ->
+                if not globalInitialized then
+                    // Initialize synchronously within the lock to ensure it only happens once
+                    let initResult = WhisperFS.initialize() |> Async.RunSynchronously
+                    match initResult with
+                    | Ok () ->
+                        globalInitialized <- true
+                        Ok ()
+                    | Error err ->
+                        Error (sprintf "Failed to initialize WhisperFS: %s" err.Message)
+                else
+                    Ok ()
+            )
+        else
+            return Ok ()
+    }
+
 type WhisperTranscriber(config: WhisperConfig) =
-    
-    let ensureModel() =
-        task {
-            if not (File.Exists(config.ModelPath)) then
-                printfn "Downloading Whisper GGML model %A..." config.ModelType
-                use! modelStream = WhisperGgmlDownloader.GetGgmlModelAsync(config.ModelType)
-                use fileWriter = File.OpenWrite(config.ModelPath)
-                do! modelStream.CopyToAsync(fileWriter)
-                printfn "Model downloaded: %s" config.ModelPath
+
+    let whisperConfig =
+        { WhisperFS.WhisperConfig.defaultConfig with
+            ModelPath = config.ModelPath
+            ModelType = config.ModelType
+            Language = config.Language
+            ThreadCount = config.ThreadCount
+            MaxLen = config.MaxSegmentLength
+            Translate = config.EnableTranslate
         }
-    
-    let whisperFactory = 
-        let initTask = task {
-            do! ensureModel()
-            let builder = WhisperFactory.FromPath(config.ModelPath)
-            return builder
+
+    let mutable clientOption: IWhisperClient option = None
+
+    // Initialize client eagerly at construction time
+    let initializeClient() =
+        async {
+            let! initResult = ensureGlobalInitialized()
+            match initResult with
+            | Ok () ->
+                // createClient is now async and returns Result
+                let! clientResult = WhisperFS.createClient whisperConfig
+                match clientResult with
+                | Ok client ->
+                    clientOption <- Some client
+                    printfn "WhisperFS client initialized successfully at startup"
+                    return Ok client
+                | Error err ->
+                    let msg = sprintf "Failed to create WhisperFS client: %s" err.Message
+                    printfn "WARNING: %s" msg
+                    return Error msg
+            | Error msg ->
+                printfn "WARNING: %s" msg
+                return Error msg
         }
-        initTask |> Async.AwaitTask |> Async.RunSynchronously
-    
-    let createProcessor() =
-        let builder = whisperFactory.CreateBuilder()
-                        .WithLanguage(config.Language)
-                        .WithThreads(config.ThreadCount)
-                        .WithMaxSegmentLength(config.MaxSegmentLength)
-        
-        let builder' = if config.EnableTranslate then builder.WithTranslate() else builder
-        builder'.Build()
-    
-    let createWavFile (samples: float32[]) (sampleRate: int) (filePath: string) =
-        use fs = new FileStream(filePath, FileMode.Create)
-        use writer = new BinaryWriter(fs)
-        
-        writer.Write("RIFF"B)
-        writer.Write(36 + samples.Length * 2)
-        writer.Write("WAVE"B)
-        writer.Write("fmt "B)
-        writer.Write(16)
-        writer.Write(1s)
-        writer.Write(1s)
-        writer.Write(sampleRate)
-        writer.Write(sampleRate * 2)
-        writer.Write(2s)
-        writer.Write(16s)
-        writer.Write("data"B)
-        writer.Write(samples.Length * 2)
-        
-        for sample in samples do
-            let pcm = int16 (Math.Max(-32768.0f, Math.Min(32767.0f, sample * 32767.0f)))
-            writer.Write(pcm)
-    
+
+    // Start initialization immediately
+    let initTask = initializeClient() |> Async.StartAsTask
+
+    let getOrCreateClient() =
+        async {
+            match clientOption with
+            | Some client -> return Ok client
+            | None ->
+                // Wait for initialization if still running
+                let! result = Async.AwaitTask initTask
+                return result
+        }
+
+    let mapSegment (segment: WhisperFS.Segment) : TranscriptionSegment =
+        {
+            Start = float segment.StartTime
+            End = float segment.EndTime
+            Text = segment.Text
+            Confidence =
+                segment.Tokens
+                |> List.tryHead
+                |> Option.map (fun t -> t.Probability)
+        }
+
     interface IWhisperTranscriber with
         member _.TranscribeAsync(samples, sampleRate) =
             async {
                 let startTime = DateTime.UtcNow
-                let tempFile = Path.GetTempFileName() + ".wav"
-                
-                try
-                    createWavFile samples sampleRate tempFile
-                    
-                    use processor = createProcessor()
-                    use fileStream = File.OpenRead(tempFile)
-                    
-                    let segments = ResizeArray<TranscriptionSegment>()
-                    let texts = ResizeArray<string>()
-                    
-                    let asyncEnum = processor.ProcessAsync(fileStream).GetAsyncEnumerator()
-                    let mutable hasMore = true
-                    while hasMore do
-                        let! moveNext = asyncEnum.MoveNextAsync().AsTask() |> Async.AwaitTask
-                        if moveNext then
-                            let segment = asyncEnum.Current
-                            segments.Add({
-                                Start = segment.Start.TotalSeconds
-                                End = segment.End.TotalSeconds
-                                Text = segment.Text
-                                Confidence = None
-                            })
-                            texts.Add(segment.Text)
-                        else
-                            hasMore <- false
-                    
-                    let processingTime = DateTime.UtcNow - startTime
-                    let audioDuration = TimeSpan.FromSeconds(float samples.Length / float sampleRate)
-                    
-                    return {
-                        FullText = String.Join(" ", texts)
-                        Segments = segments |> List.ofSeq
-                        Duration = audioDuration
-                        ProcessingTime = processingTime
-                        Timestamp = startTime
-                    }
-                finally
-                    if File.Exists(tempFile) then
-                        File.Delete(tempFile)
+
+                let! clientResult = getOrCreateClient()
+                match clientResult with
+                | Error msg ->
+                    return failwith msg
+                | Ok client ->
+                    let! result = client.ProcessAsync(samples)
+
+                    match result with
+                    | Ok transcription ->
+                        let processingTime = DateTime.UtcNow - startTime
+                        let audioDuration = TimeSpan.FromSeconds(float samples.Length / float sampleRate)
+
+                        return {
+                            FullText = transcription.FullText
+                            Segments = transcription.Segments |> List.map mapSegment
+                            Duration = audioDuration
+                            ProcessingTime = processingTime
+                            Timestamp = startTime
+                        }
+                    | Error err ->
+                        return failwithf "Transcription failed: %s" err.Message
             }
-        
+
         member _.TranscribeFileAsync(audioPath) =
             async {
                 let startTime = DateTime.UtcNow
-                use processor = createProcessor()
-                use fileStream = File.OpenRead(audioPath)
-                
-                let segments = ResizeArray<TranscriptionSegment>()
-                let texts = ResizeArray<string>()
-                
-                let asyncEnum = processor.ProcessAsync(fileStream).GetAsyncEnumerator()
-                let mutable hasMore = true
-                while hasMore do
-                    let! moveNext = asyncEnum.MoveNextAsync().AsTask() |> Async.AwaitTask
-                    if moveNext then
-                        let segment = asyncEnum.Current
-                        segments.Add({
-                            Start = segment.Start.TotalSeconds
-                            End = segment.End.TotalSeconds
-                            Text = segment.Text
-                            Confidence = None
-                        })
-                        texts.Add(segment.Text)
-                    else
-                        hasMore <- false
-                
-                let processingTime = DateTime.UtcNow - startTime
-                
-                return {
-                    FullText = String.Join(" ", texts)
-                    Segments = segments |> List.ofSeq
-                    Duration = TimeSpan.Zero
-                    ProcessingTime = processingTime
-                    Timestamp = startTime
-                }
-            }
-        
-        member _.IsModelLoaded = File.Exists(config.ModelPath)
-        
-        member _.Dispose() =
-            whisperFactory.Dispose()
 
-let downloadModel (modelType: GgmlType) (targetPath: string) =
-    task {
+                let! clientResult = getOrCreateClient()
+                match clientResult with
+                | Error msg ->
+                    return failwith msg
+                | Ok client ->
+                    let! result = client.ProcessFileAsync(audioPath)
+
+                    match result with
+                    | Ok transcription ->
+                        let processingTime = DateTime.UtcNow - startTime
+
+                        return {
+                            FullText = transcription.FullText
+                            Segments = transcription.Segments |> List.map mapSegment
+                            Duration = transcription.Duration
+                            ProcessingTime = processingTime
+                            Timestamp = startTime
+                        }
+                    | Error err ->
+                        return failwithf "Transcription failed: %s" err.Message
+            }
+
+        member _.IsModelLoaded = File.Exists(config.ModelPath)
+
+        member _.Dispose() =
+            match clientOption with
+            | Some client -> client.Dispose()
+            | None -> ()
+
+let downloadModel (modelType: ModelType) (targetPath: string) =
+    async {
         printfn "Downloading model %A to %s" modelType targetPath
-        use! stream = WhisperGgmlDownloader.GetGgmlModelAsync(modelType)
-        use fileStream = File.Create(targetPath)
-        do! stream.CopyToAsync(fileStream)
-        printfn "Model download complete: %s" targetPath
+
+        // Create directory if it doesn't exist
+        let directory = Path.GetDirectoryName(targetPath)
+        if not (Directory.Exists(directory)) then
+            Directory.CreateDirectory(directory) |> ignore
+
+        // Use WhisperFS's model downloader
+        let! result = Runtime.Models.downloadModelAsync modelType
+        match result with
+        | Ok modelPath ->
+            // Copy to target path if different
+            if modelPath <> targetPath then
+                File.Copy(modelPath, targetPath, true)
+            printfn "Model downloaded successfully to %s" targetPath
+        | Error err ->
+            failwithf "Failed to download model: %s" err.Message
     }
 
-let getModelInfo (modelType: GgmlType) =
-    let (size, isQuantized) =
-        match modelType with
-        | GgmlType.Tiny -> 39L * 1024L * 1024L, false
-        | GgmlType.TinyEn -> 39L * 1024L * 1024L, false
-        | GgmlType.Base -> 142L * 1024L * 1024L, false
-        | GgmlType.BaseEn -> 142L * 1024L * 1024L, false
-        | GgmlType.Small -> 466L * 1024L * 1024L, false
-        | GgmlType.SmallEn -> 466L * 1024L * 1024L, false
-        | GgmlType.Medium -> 1500L * 1024L * 1024L, false
-        | GgmlType.MediumEn -> 1500L * 1024L * 1024L, false
-        | GgmlType.LargeV1 -> 3000L * 1024L * 1024L, false
-        | GgmlType.LargeV2 -> 3000L * 1024L * 1024L, false
-        | GgmlType.LargeV3 -> 3000L * 1024L * 1024L, false
-        | _ -> 0L, false
-    
+let getModelInfo (modelType: ModelType) =
     {
         ModelType = modelType
-        Size = size
+        Size = modelType.GetModelSize()
         Url = None
-        IsQuantized = isQuantized
+        IsQuantized = false
     }
